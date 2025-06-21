@@ -1,412 +1,383 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file, current_app
+from flask_socketio import emit
 from services.simulation_service import SimulationService
 from services.analysis_service import AnalysisService
-from api.schemas import validate_simulation_request, validate_random_target_request
+from services.websocket_service import WebSocketService
+from services.config_service import ConfigService
+from services.export_service import ExportService
+from api.schemas import (
+    validate_simulation_request,
+    validate_random_target_request,
+    validate_config_request,
+    validate_export_request
+)
 import traceback
 import logging
 import numpy as np
+import uuid
+import os
+from datetime import datetime
+from functools import wraps
 
 # 设置日志
 logger = logging.getLogger(__name__)
 
 api_bp = Blueprint('api', __name__)
+
+# 服务实例初始化
 simulation_service = SimulationService()
 analysis_service = AnalysisService()
+websocket_service = WebSocketService()
+config_service = ConfigService()
+export_service = ExportService()
 
 
-@api_bp.route('/simulate', methods=['POST'])
-def run_simulation():
-    try:
-        data = request.get_json()
+def handle_api_error(f):
+    """API错误处理装饰器"""
 
-        is_valid, error_msg = validate_simulation_request(data)
-        if not is_valid:
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except ValueError as e:
+            logger.warning(f"Validation error in {f.__name__}: {str(e)}")
             return jsonify({
                 'status': 'error',
-                'msg': error_msg
+                'message': str(e)
             }), 400
+        except FileNotFoundError as e:
+            logger.error(f"File not found in {f.__name__}: {str(e)}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Resource not found'
+            }), 404
+        except Exception as e:
+            logger.error(f"Unexpected error in {f.__name__}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'status': 'error',
+                'message': 'Internal server error',
+                'debug': str(e) if current_app.debug else None
+            }), 500
 
-        init_result = simulation_service.initialize_simulation(data)
-        if init_result['status'] == 'error':
-            return jsonify(init_result), 400
-
-        simulation_result = simulation_service.run_simulation()
-
-        return jsonify(simulation_result)
-
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
+    return decorated_function
 
 
-@api_bp.route('/status', methods=['GET'])
-def get_simulation_status():
+# === 仿真管理接口 ===
+
+@api_bp.route('/simulation/start', methods=['POST'])
+@handle_api_error
+def start_simulation():
+    """启动仿真"""
+    data = request.get_json()
+    if not data:
+        raise ValueError("Request body is required")
+
+    # 验证请求
+    is_valid, error_msg = validate_simulation_request(data)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    # 生成仿真ID
+    simulation_id = str(uuid.uuid4())
+
+    # 初始化仿真
+    init_result = simulation_service.initialize_simulation(data, simulation_id)
+    if init_result['status'] == 'error':
+        raise ValueError(init_result.get('message', 'Failed to initialize simulation'))
+
+    # 启动异步仿真任务
+    result = simulation_service.start_async_simulation(simulation_id)
+
+    return jsonify({
+        'status': 'success',
+        'simulation_id': simulation_id,
+        'message': 'Simulation started',
+        'data': result
+    })
+
+
+@api_bp.route('/simulation/<simulation_id>/stop', methods=['POST'])
+@handle_api_error
+def stop_simulation(simulation_id):
+    """停止仿真"""
+    if not simulation_id:
+        raise ValueError("Simulation ID is required")
+
+    result = simulation_service.stop_simulation(simulation_id)
+
+    # 通知前端仿真已停止
     try:
-        status = simulation_service.get_simulation_status()
-        return jsonify({
-            'status': 'success',
-            'data': status
-        })
+        websocket_service.emit_simulation_stopped(simulation_id)
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        logger.warning(f"Failed to emit websocket message: {str(e)}")
+
+    return jsonify({
+        'status': 'success',
+        'message': 'Simulation stopped',
+        'data': result
+    })
+
+
+@api_bp.route('/simulation/<simulation_id>/status', methods=['GET'])
+@handle_api_error
+def get_simulation_status(simulation_id):
+    """获取仿真状态"""
+    if not simulation_id:
+        raise ValueError("Simulation ID is required")
+
+    status = simulation_service.get_simulation_status(simulation_id)
+    return jsonify({
+        'status': 'success',
+        'data': status
+    })
+
+
+@api_bp.route('/simulation/<simulation_id>/data', methods=['GET'])
+@handle_api_error
+def get_simulation_data(simulation_id):
+    """获取仿真数据"""
+    if not simulation_id:
+        raise ValueError("Simulation ID is required")
+
+    # 获取并验证查询参数
+    start_time = request.args.get('start_time', type=float, default=0.0)
+    end_time = request.args.get('end_time', type=float)
+    data_types = request.args.getlist('data_types')
+
+    # 验证时间范围
+    if end_time is not None and start_time >= end_time:
+        raise ValueError("start_time must be less than end_time")
+
+    data = simulation_service.get_simulation_data(
+        simulation_id, start_time, end_time, data_types
+    )
+
+    return jsonify({
+        'status': 'success',
+        'data': data
+    })
+
+
+@api_bp.route('/simulation/<simulation_id>/pause', methods=['POST'])
+@handle_api_error
+def pause_simulation(simulation_id):
+    """暂停仿真"""
+    if not simulation_id:
+        raise ValueError("Simulation ID is required")
+
+    result = simulation_service.pause_simulation(simulation_id)
+    return jsonify({
+        'status': 'success',
+        'message': 'Simulation paused',
+        'data': result
+    })
+
+
+@api_bp.route('/simulation/<simulation_id>/resume', methods=['POST'])
+@handle_api_error
+def resume_simulation(simulation_id):
+    """恢复仿真"""
+    if not simulation_id:
+        raise ValueError("Simulation ID is required")
+
+    result = simulation_service.resume_simulation(simulation_id)
+    return jsonify({
+        'status': 'success',
+        'message': 'Simulation resumed',
+        'data': result
+    })
+
+
+# === 配置管理接口 ===
+
+@api_bp.route('/config/save', methods=['POST'])
+@handle_api_error
+def save_configuration():
+    """保存配置"""
+    data = request.get_json()
+    if not data:
+        raise ValueError("Configuration data is required")
+
+    is_valid, error_msg = validate_config_request(data)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    config_id = config_service.save_configuration(data)
+
+    return jsonify({
+        'status': 'success',
+        'config_id': config_id,
+        'message': 'Configuration saved successfully'
+    })
+
+
+@api_bp.route('/config/<config_id>', methods=['GET'])
+@handle_api_error
+def load_configuration(config_id):
+    """加载配置"""
+    if not config_id:
+        raise ValueError("Configuration ID is required")
+
+    config = config_service.load_configuration(config_id)
+    return jsonify({
+        'status': 'success',
+        'data': config
+    })
+
+
+@api_bp.route('/config/list', methods=['GET'])
+@handle_api_error
+def list_configurations():
+    """获取配置列表"""
+    # 获取分页参数
+    page = request.args.get('page', type=int, default=1)
+    per_page = request.args.get('per_page', type=int, default=20)
+
+    if page < 1 or per_page < 1 or per_page > 100:
+        raise ValueError("Invalid pagination parameters")
+
+    configs = config_service.list_configurations(page=page, per_page=per_page)
+    return jsonify({
+        'status': 'success',
+        'data': configs
+    })
 
 
 @api_bp.route('/analyze', methods=['POST'])
+@handle_api_error
 def analyze_results():
-    try:
-        data = request.get_json()
+    """分析仿真结果"""
+    data = request.get_json()
+    if not data:
+        raise ValueError("Analysis data is required")
 
-        if 'results' not in data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Missing results data'
-            }), 400
+    # 验证数据结构
+    if 'results' not in data:
+        raise ValueError("Results data is required")
 
-        analysis = analysis_service.analyze_simulation_results(data['results'])
+    results = data['results']
 
-        return jsonify({
-            'status': 'success',
-            'analysis': analysis
-        })
+    # 验证必要的数据字段
+    if 'summary' not in results:
+        raise ValueError("Summary data is required")
 
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    # 调用分析服务
+    analysis_result = analysis_service.analyze_simulation_results(results)
+
+    return jsonify({
+        'status': 'success',
+        'analysis': analysis_result,
+        'message': 'Analysis completed successfully'
+    })
+
+# === 数据导出接口 ===
+
+@api_bp.route('/export/start', methods=['POST'])
+@handle_api_error
+def start_export():
+    """开始导出"""
+    data = request.get_json()
+    if not data:
+        raise ValueError("Export configuration is required")
+
+    is_valid, error_msg = validate_export_request(data)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    export_id = export_service.start_export(data)
+
+    return jsonify({
+        'status': 'success',
+        'export_id': export_id,
+        'message': 'Export started'
+    })
 
 
-@api_bp.route('/performance', methods=['POST'])
-def get_performance_metrics():
-    try:
-        data = request.get_json()
+@api_bp.route('/export/<export_id>/download', methods=['GET'])
+@handle_api_error
+def download_export_file(export_id):
+    """下载导出文件"""
+    if not export_id:
+        raise ValueError("Export ID is required")
 
-        metrics = analysis_service.calculate_performance_metrics(data)
+    file_path = export_service.get_export_file_path(export_id)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Export file not found for ID: {export_id}")
 
-        return jsonify({
-            'status': 'success',
-            'metrics': metrics
-        })
-
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+    return send_file(file_path, as_attachment=True)
 
 
-@api_bp.route('/export', methods=['POST'])
-def export_results():
-    try:
-        data = request.get_json()
+# === 系统信息接口 ===
 
-        export_result = analysis_service.export_simulation_data(
-            data['results'],
-            data.get('format', 'json')
-        )
-
-        return jsonify({
-            'status': 'success',
-            'export': export_result
-        })
-
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+@api_bp.route('/system/info', methods=['GET'])
+@handle_api_error
+def get_system_info():
+    """获取系统信息"""
+    info = {
+        'version': '1.0.0',
+        'api_version': '1.0',
+        'server_time': datetime.now().isoformat(),
+        'active_simulations': simulation_service.get_active_simulation_count(),
+        'system_status': 'running'
+    }
+    return jsonify({
+        'status': 'success',
+        'data': info
+    })
 
 
 @api_bp.route('/health', methods=['GET'])
 def health_check():
+    """健康检查"""
     return jsonify({
         'status': 'success',
         'message': 'Radar simulation API is running',
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'timestamp': datetime.now().isoformat()
+    })
+
+
+# === 兼容性接口 ===
+
+@api_bp.route('/simulate', methods=['POST'])
+@handle_api_error
+def run_simulation():
+    """运行仿真（单次，兼容性保留）"""
+    data = request.get_json()
+    if not data:
+        raise ValueError("Simulation configuration is required")
+
+    is_valid, error_msg = validate_simulation_request(data)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    init_result = simulation_service.initialize_simulation(data)
+    if init_result['status'] == 'error':
+        raise ValueError(init_result.get('message', 'Failed to initialize simulation'))
+
+    simulation_result = simulation_service.run_simulation()
+    return jsonify(simulation_result)
+
+
+@api_bp.route('/status', methods=['GET'])
+@handle_api_error
+def get_status():
+    """获取仿真状态（兼容性保留）"""
+    status = simulation_service.get_legacy_status()
+    return jsonify({
+        'status': 'success',
+        'data': status
     })
 
 
 @api_bp.route('/reset', methods=['POST'])
-def reset_simulation():
-    try:
-        simulation_service.reset_simulation()
-        return jsonify({
-            'status': 'success',
-            'message': 'Simulation reset successfully'
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-
-# 新增的随机目标生成API
-@api_bp.route('/generate-random-targets', methods=['POST'])
-def generate_random_targets():
-    """生成随机目标"""
-    try:
-        data = request.get_json()
-
-        # 验证输入参数
-        is_valid, errors = validate_random_target_request(data)
-        if not is_valid:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid input parameters',
-                'details': errors
-            }), 400
-
-        # 从models.target导入生成器
-        from models.target import RandomTargetGenerator
-
-        generator = RandomTargetGenerator()
-
-        # 提取参数
-        num_targets = data.get('num_targets', 5)
-        altitude_type = data.get('altitude_type', 'mixed')
-        velocity_type = data.get('velocity_type', 'mixed')
-        rcs_type = data.get('rcs_type', 'mixed')
-        radar_range = data.get('radar_range', 100000)
-        enable_formation = data.get('enable_formation', True)
-        specific_types = data.get('specific_types', None)
-        scenario_type = data.get('scenario_type', None)
-
-        # 生成目标
-        if scenario_type:
-            targets = generator.generate_threat_scenario(scenario_type)
-        else:
-            targets = generator.generate_random_targets(
-                num_targets=num_targets,
-                altitude_type=altitude_type,
-                velocity_type=velocity_type,
-                rcs_type=rcs_type,
-                radar_range=radar_range,
-                enable_formation=enable_formation,
-                specific_types=specific_types
-            )
-
-        return jsonify({
-            'success': True,
-            'targets': targets,
-            'summary': {
-                'total_targets': len(targets),
-                'formations': len(set([t['formation_id'] for t in targets if t['formation_id']])),
-                'target_types': list(set([t['type'] for t in targets]))
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Random target generation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Random target generation failed',
-            'details': str(e)
-        }), 500
-
-
-@api_bp.route('/target-presets', methods=['GET'])
-def get_target_presets():
-    """获取目标预设配置"""
-    try:
-        from models.target import RandomTargetGenerator
-
-        generator = RandomTargetGenerator()
-
-        return jsonify({
-            'success': True,
-            'presets': {
-                'altitude_types': list(generator.altitude_ranges.keys()),
-                'velocity_types': list(generator.velocity_ranges.keys()),
-                'rcs_types': list(generator.rcs_ranges.keys()),
-                'target_types': list(generator.target_types.keys()),
-                'formation_types': list(generator.formation_types.keys()),
-                'scenario_types': ['air_raid', 'patrol', 'low_altitude_penetration', 'swarm_attack', 'mixed']
-            },
-            'ranges': {
-                'altitude_ranges': generator.altitude_ranges,
-                'velocity_ranges': generator.velocity_ranges,
-                'rcs_ranges': generator.rcs_ranges,
-                'target_specifications': generator.target_types
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Get target presets error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Failed to get target presets',
-            'details': str(e)
-        }), 500
-
-
-@api_bp.route('/random-scenario/<scenario_type>', methods=['POST'])
-def generate_random_scenario(scenario_type):
-    """生成预定义威胁场景"""
-    try:
-        from models.target import RandomTargetGenerator
-
-        generator = RandomTargetGenerator()
-        targets = generator.generate_threat_scenario(scenario_type)
-
-        return jsonify({
-            'success': True,
-            'scenario_type': scenario_type,
-            'targets': targets,
-            'summary': {
-                'total_targets': len(targets),
-                'formations': len(set([t['formation_id'] for t in targets if t['formation_id']])),
-                'target_types': list(set([t['type'] for t in targets])),
-                'altitude_range': [
-                    min([t['altitude'] for t in targets]),
-                    max([t['altitude'] for t in targets])
-                ] if targets else [0, 0],
-                'velocity_range': [
-                    min([np.linalg.norm(t['velocity']) for t in targets]),
-                    max([np.linalg.norm(t['velocity']) for t in targets])
-                ] if targets else [0, 0]
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Random scenario generation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Random scenario generation failed',
-            'details': str(e)
-        }), 500
-
-
-@api_bp.route('/simulate-with-random-targets', methods=['POST'])
-def simulate_with_random_targets():
-    """运行带随机目标的仿真"""
-    try:
-        data = request.get_json()
-
-        # 验证基本仿真参数
-        is_valid, error_msg = validate_simulation_request(data)
-        if not is_valid:
-            return jsonify({
-                'status': 'error',
-                'message': error_msg
-            }), 400
-
-        # 如果包含随机目标配置，先验证随机目标参数
-        if 'random_targets' in data:
-            is_valid, errors = validate_random_target_request(data['random_targets'])
-            if not is_valid:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Invalid random target parameters',
-                    'details': errors
-                }), 400
-
-        # 运行带随机目标的仿真
-        result = simulation_service.run_simulation_with_random_targets(data)
-
-        return jsonify(result)
-
-    except Exception as e:
-        logger.error(f"Random target simulation error: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': 'Random target simulation failed',
-            'details': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
-
-
-@api_bp.route('/target-statistics', methods=['POST'])
-def get_target_statistics():
-    """获取目标统计信息"""
-    try:
-        data = request.get_json()
-
-        if 'targets' not in data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Missing targets data'
-            }), 400
-
-        targets = data['targets']
-
-        # 计算统计信息
-        stats = {
-            'total_count': len(targets),
-            'type_distribution': {},
-            'altitude_stats': {},
-            'velocity_stats': {},
-            'rcs_stats': {},
-            'formation_stats': {}
-        }
-
-        if not targets:
-            return jsonify({
-                'status': 'success',
-                'statistics': stats
-            })
-
-        # 提取数据
-        altitudes = [t.get('altitude', 0) for t in targets]
-        velocities = [np.linalg.norm(t.get('velocity', [0, 0, 0])) for t in targets]
-        rcs_values = [t.get('rcs', 0) for t in targets]
-        target_types = [t.get('type', 'unknown') for t in targets]
-        formation_ids = [t.get('formation_id') for t in targets]
-
-        # 类型分布
-        for ttype in target_types:
-            stats['type_distribution'][ttype] = stats['type_distribution'].get(ttype, 0) + 1
-
-        # 高度统计
-        stats['altitude_stats'] = {
-            'min': float(np.min(altitudes)),
-            'max': float(np.max(altitudes)),
-            'mean': float(np.mean(altitudes)),
-            'std': float(np.std(altitudes))
-        }
-
-        # 速度统计
-        stats['velocity_stats'] = {
-            'min': float(np.min(velocities)),
-            'max': float(np.max(velocities)),
-            'mean': float(np.mean(velocities)),
-            'std': float(np.std(velocities))
-        }
-
-        # RCS统计
-        stats['rcs_stats'] = {
-            'min': float(np.min(rcs_values)),
-            'max': float(np.max(rcs_values)),
-            'mean': float(np.mean(rcs_values)),
-            'std': float(np.std(rcs_values))
-        }
-
-        # 编队统计
-        formations = [fid for fid in formation_ids if fid is not None]
-        unique_formations = set(formations)
-
-        stats['formation_stats'] = {
-            'formation_count': len(unique_formations),
-            'formation_members': len(formations),
-            'single_targets': len(targets) - len(formations),
-            'avg_formation_size': len(formations) / len(unique_formations) if unique_formations else 0
-        }
-
-        return jsonify({
-            'status': 'success',
-            'statistics': stats
-        })
-
-    except Exception as e:
-        logger.error(f"Target statistics error: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': 'Failed to calculate target statistics',
-            'details': str(e)
-        }), 500
+@handle_api_error
+def reset():
+    """重置仿真"""
+    result = simulation_service.reset_all_simulations()
+    return jsonify({
+        'status': 'success',
+        'message': 'All simulations reset',
+        'data': result
+    })
