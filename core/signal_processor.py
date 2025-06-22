@@ -1,242 +1,471 @@
 import numpy as np
-from typing import List, Tuple, Optional
-from models.tracking import Detection
-from models.radar_system import RadarSystem
-from models.environment import Environment
-from config.settings import Config
+import pyfftw
+from typing import List, Dict, Any, Optional, Protocol
+from dataclasses import dataclass, field
+from enum import Enum
+import heapq
+from abc import ABC, abstractmethod
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 
-class SignalProcessor:
-    def __init__(self, radar_system: RadarSystem, environment: Environment):
-        self.radar_system = radar_system
-        self.environment = environment
-        self.c = Config.SPEED_OF_LIGHT
+class TaskType(Enum):
+    TARGET_CONFIRMATION = 1
+    HIGH_PRIORITY_TRACKING = 2
+    LOST_TARGET_SEARCH = 3
+    WEAK_TARGET_TRACKING = 4
+    NORMAL_TRACKING = 5
+    AREA_SEARCH = 6
 
-    def process_radar_signal(self, raw_signal: np.ndarray, timestamp: float) -> List[Detection]:
-        """处理雷达信号的主函数"""
-        try:
-            clutter_suppressed = self._adaptive_clutter_suppression(raw_signal)
-            sidelobe_suppressed = self._two_stage_sidelobe_suppression(clutter_suppressed)
-            compressed = self._pulse_compression(sidelobe_suppressed)
-            detections = self._cfar_detection(compressed, timestamp)
-            doppler_processed = self._adaptive_doppler_processing(detections)
-            return doppler_processed
-        except Exception as e:
-            print(f"Error in signal processing: {e}")
-            return []
 
-    def _adaptive_clutter_suppression(self, signal: np.ndarray) -> np.ndarray:
-        """自适应杂波抑制"""
-        n_channels = 16
-        training_length = max(1, int(len(signal) * getattr(self.environment, 'clutter_density', 0.1)))
+@dataclass
+class RadarTask:
+    task_id: int
+    task_type: TaskType
+    duration: float
+    release_time: float
+    due_time: float
+    target_id: Optional[int] = None
+    beam_position: Optional[Dict[str, float]] = None
+    hard_constraint: bool = False
+    priority: float = field(init=False)
 
-        # 修复：初始化为复数类型
-        clutter_covariance = np.eye(n_channels, dtype=complex) * 0.1
+    def __post_init__(self):
+        if self.duration <= 0:
+            raise ValueError("Task duration must be positive")
+        if self.due_time < self.release_time:
+            raise ValueError("Due time cannot be earlier than release time")
 
-        # 确保有足够的数据进行训练
-        max_iterations = min(training_length, len(signal) - n_channels)
-        if max_iterations <= 0:
-            return signal.copy()
 
-        for i in range(max_iterations):
-            if i + n_channels <= len(signal):
-                data_vector = signal[i:i + n_channels]
-                # 计算外积并累加到协方差矩阵
-                clutter_covariance += np.outer(data_vector, np.conj(data_vector))
+@dataclass
+class ScheduleResult:
+    scheduled_tasks: List[RadarTask]
+    delayed_tasks: List[RadarTask]
+    cancelled_tasks: List[RadarTask]
+    total_time: float
+    efficiency: float
+    doppler_results: Optional[Dict[int, np.ndarray]] = None
 
-        # 归一化协方差矩阵
-        if training_length > 0:
-            clutter_covariance /= training_length
 
-        try:
-            # 添加对角加载以确保矩阵可逆
-            inv_cov = np.linalg.inv(clutter_covariance + np.eye(n_channels, dtype=complex) * 1e-6)
-            steering_vector = np.ones(n_channels, dtype=complex)
-            weights = inv_cov @ steering_vector
+@dataclass
+class SchedulingConfig:
+    """调度配置参数"""
+    schedule_interval: float = 60.0
+    priority_weights: Dict[str, float] = field(default_factory=lambda: {
+        'base': 0.5,
+        'time': 0.3,
+        'environment': 0.2
+    })
+    time_step: float = 1.0
+    max_delay_ratio: float = 0.5
 
-            # 归一化权重
-            denominator = np.conj(steering_vector).T @ inv_cov @ steering_vector
-            if abs(denominator) > 1e-10:
-                weights /= denominator
+
+class PriorityCalculator:
+    """统一的优先级计算器"""
+
+    def __init__(self, config: SchedulingConfig):
+        self.config = config
+
+    def calculate_dynamic_priority(self, task: RadarTask, current_time: float) -> float:
+        base_priority = task.task_type.value
+
+        # 时间因子计算
+        time_factor = self._calculate_time_factor(task, current_time)
+
+        # 环境因子计算
+        env_factor = self._calculate_environment_factor(task)
+
+        # 综合优先级（数值越大优先级越高）
+        weights = self.config.priority_weights
+        comprehensive_priority = (
+                weights['base'] * (10 - base_priority) +  # 反转基础优先级
+                weights['time'] * time_factor +
+                weights['environment'] * env_factor
+        )
+
+        return comprehensive_priority
+
+    def _calculate_time_factor(self, task: RadarTask, current_time: float) -> float:
+        if task.due_time <= current_time:
+            return 10.0  # 已过期，最高时间优先级
+
+        time_to_deadline = task.due_time - current_time
+        schedule_interval = self.config.schedule_interval
+
+        if time_to_deadline > schedule_interval:
+            return 1.0
+
+        return 1.0 + (schedule_interval / time_to_deadline)
+
+    def _calculate_environment_factor(self, task: RadarTask) -> float:
+        if task.task_type in [TaskType.TARGET_CONFIRMATION, TaskType.HIGH_PRIORITY_TRACKING]:
+            return 1.5
+        return 1.0
+
+
+class SchedulingStrategy(ABC):
+    """调度策略抽象基类"""
+
+    @abstractmethod
+    def schedule(self, tasks: List[RadarTask], current_time: float,
+                 config: SchedulingConfig) -> ScheduleResult:
+        pass
+
+
+class PriorityBasedStrategy(SchedulingStrategy):
+    """基于优先级的调度策略"""
+
+    def __init__(self, priority_calculator: PriorityCalculator):
+        self.priority_calculator = priority_calculator
+
+    def schedule(self, tasks: List[RadarTask], current_time: float,
+                 config: SchedulingConfig) -> ScheduleResult:
+        # 计算动态优先级并排序（优先级高的在前）
+        for task in tasks:
+            task.priority = self.priority_calculator.calculate_dynamic_priority(task, current_time)
+
+        tasks_sorted = sorted(tasks, key=lambda t: t.priority, reverse=True)
+
+        scheduled = []
+        delayed = []
+        cancelled = []
+        time_pointer = current_time
+
+        for task in tasks_sorted:
+            if self._can_schedule_task(task, time_pointer, current_time, config):
+                scheduled.append(task)
+                time_pointer += task.duration
             else:
-                weights = np.ones(n_channels, dtype=complex) / n_channels
-        except np.linalg.LinAlgError:
-            # 如果矩阵求逆失败，使用均匀权重
-            weights = np.ones(n_channels, dtype=complex) / n_channels
+                if self._should_delay_task(task, time_pointer, config):
+                    delayed.append(task)
+                else:
+                    cancelled.append(task)
 
-        # 应用权重进行杂波抑制
-        output = np.zeros(len(signal), dtype=complex)
-        for i in range(len(signal) - n_channels + 1):
-            if i + n_channels <= len(signal):
-                data_vector = signal[i:i + n_channels]
-                output[i + n_channels // 2] = np.conj(weights).T @ data_vector
+        efficiency = len(scheduled) / len(tasks) if tasks else 0.0
 
-        # 处理边界情况
-        for i in range(n_channels // 2):
-            output[i] = signal[i]
-        for i in range(len(signal) - n_channels // 2, len(signal)):
-            output[i] = signal[i]
+        return ScheduleResult(
+            scheduled_tasks=scheduled,
+            delayed_tasks=delayed,
+            cancelled_tasks=cancelled,
+            total_time=time_pointer - current_time,
+            efficiency=efficiency
+        )
 
-        return output
+    def _can_schedule_task(self, task: RadarTask, time_pointer: float,
+                           current_time: float, config: SchedulingConfig) -> bool:
+        if task.hard_constraint:
+            return time_pointer + task.duration <= task.due_time
 
-    def _two_stage_sidelobe_suppression(self, signal: np.ndarray) -> np.ndarray:
-        """两级旁瓣抑制"""
+        return (time_pointer < current_time + config.schedule_interval and
+                time_pointer + task.duration <= task.due_time)
+
+    def _should_delay_task(self, task: RadarTask, time_pointer: float,
+                           config: SchedulingConfig) -> bool:
+        return task.due_time - time_pointer > task.duration * config.max_delay_ratio
+
+
+class TimePointerStrategy(SchedulingStrategy):
+    """改进的时间指针调度策略"""
+
+    def __init__(self, priority_calculator: PriorityCalculator):
+        self.priority_calculator = priority_calculator
+
+    def schedule(self, tasks: List[RadarTask], current_time: float,
+                 config: SchedulingConfig) -> ScheduleResult:
+        # 使用优先队列优化任务选择
+        available_tasks = []
+        for task in tasks:
+            task.priority = self.priority_calculator.calculate_dynamic_priority(task, current_time)
+            heapq.heappush(available_tasks, (-task.priority, task.task_id, task))
+
+        time_pointer = current_time
+        scheduled = []
+        delayed = []
+        cancelled = []
+
+        # 获取所有关键时间点
+        time_points = self._get_time_points(tasks, current_time, config)
+
+        for target_time in sorted(time_points):
+            if target_time > current_time + config.schedule_interval:
+                break
+
+            time_pointer = max(time_pointer, target_time)
+
+            # 找到最佳可调度任务
+            best_task = self._find_best_schedulable_task(available_tasks, time_pointer)
+
+            if best_task:
+                scheduled.append(best_task)
+                time_pointer += best_task.duration
+                self._remove_task_from_heap(available_tasks, best_task)
+
+        # 处理剩余任务
+        remaining_tasks = [task for _, _, task in available_tasks]
+        for task in remaining_tasks:
+            if task.due_time > time_pointer:
+                delayed.append(task)
+            else:
+                cancelled.append(task)
+
+        efficiency = len(scheduled) / len(tasks) if tasks else 0.0
+
+        return ScheduleResult(
+            scheduled_tasks=scheduled,
+            delayed_tasks=delayed,
+            cancelled_tasks=cancelled,
+            total_time=time_pointer - current_time,
+            efficiency=efficiency
+        )
+
+    def _get_time_points(self, tasks: List[RadarTask], current_time: float,
+                         config: SchedulingConfig) -> List[float]:
+        """获取所有关键时间点"""
+        time_points = {current_time}
+        for task in tasks:
+            time_points.add(task.release_time)
+            time_points.add(task.due_time)
+        return list(time_points)
+
+    def _find_best_schedulable_task(self, available_tasks: List, time_pointer: float) -> Optional[RadarTask]:
+        """从堆中找到最佳可调度任务"""
+        temp_removed = []
+        best_task = None
+
+        while available_tasks:
+            neg_priority, task_id, task = heapq.heappop(available_tasks)
+
+            if (task.release_time <= time_pointer and
+                    task.due_time >= time_pointer + task.duration):
+                best_task = task
+                # 将其他任务放回堆中
+                for item in temp_removed:
+                    heapq.heappush(available_tasks, item)
+                break
+            else:
+                temp_removed.append((neg_priority, task_id, task))
+
+        # 如果没找到合适任务，将所有任务放回堆中
+        if not best_task:
+            for item in temp_removed:
+                heapq.heappush(available_tasks, item)
+
+        return best_task
+
+    def _remove_task_from_heap(self, available_tasks: List, task_to_remove: RadarTask):
+        """从堆中移除指定任务"""
+        for i, (neg_priority, task_id, task) in enumerate(available_tasks):
+            if task.task_id == task_to_remove.task_id:
+                available_tasks[i] = available_tasks[-1]
+                available_tasks.pop()
+                if i < len(available_tasks):
+                    heapq.heapify(available_tasks)
+                break
+
+
+class DopplerProcessor:
+    """多普勒处理器，使用PyFFTW优化FFT计算"""
+
+    def __init__(self, fft_size: int = 1024, num_threads: int = 4):
+        self.fft_size = fft_size
+        self.num_threads = num_threads
+        self._setup_fftw()
+        self.logger = logging.getLogger(__name__)
+
+    def _setup_fftw(self):
+        """设置PyFFTW"""
+        # 启用多线程
+        pyfftw.config.NUM_THREADS = self.num_threads
+        pyfftw.config.PLANNER_EFFORT = 'FFTW_MEASURE'
+
+        # 预分配数组和创建FFT对象
+        self.input_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
+        self.output_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
+
+        # 创建FFTW对象（会自动优化）
+        self.fft_forward = pyfftw.FFTW(
+            self.input_array, self.output_array,
+            direction='FFTW_FORWARD',
+            flags=('FFTW_MEASURE',),
+            threads=self.num_threads
+        )
+
+        self.fft_backward = pyfftw.FFTW(
+            self.output_array, self.input_array,
+            direction='FFTW_BACKWARD',
+            flags=('FFTW_MEASURE',),
+            threads=self.num_threads
+        )
+
+    def process_doppler_batch(self, radar_data: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+        """批量处理多普勒数据"""
+        results = {}
+
+        # 使用线程池并行处理多个目标
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            future_to_target = {
+                executor.submit(self._process_single_target, target_id, data): target_id
+                for target_id, data in radar_data.items()
+            }
+
+            for future in future_to_target:
+                target_id = future_to_target[future]
+                try:
+                    results[target_id] = future.result()
+                except Exception as e:
+                    self.logger.error(f"Error processing target {target_id}: {e}")
+                    results[target_id] = None
+
+        return results
+
+    def _process_single_target(self, target_id: int, data: np.ndarray) -> np.ndarray:
+        """处理单个目标的多普勒数据"""
+        if len(data) != self.fft_size:
+            # 如果数据长度不匹配，进行填充或截断
+            if len(data) < self.fft_size:
+                padded_data = np.zeros(self.fft_size, dtype=complex)
+                padded_data[:len(data)] = data
+                data = padded_data
+            else:
+                data = data[:self.fft_size]
+
+        # 将数据复制到预分配的数组中
+        self.input_array[:] = data
+
+        # 执行FFT
+        self.fft_forward()
+
+        # 应用窗函数（汉明窗）
+        window = np.hamming(self.fft_size)
+        windowed_result = self.output_array * window
+
+        # 计算功率谱密度
+        psd = np.abs(windowed_result) ** 2
+
+        # 多普勒频率范围（假设PRF为1000Hz）
+        prf = 1000.0
+        doppler_freqs = np.fft.fftfreq(self.fft_size, 1 / prf)
+
+        # 移零频到中心
+        psd_shifted = np.fft.fftshift(psd)
+        freqs_shifted = np.fft.fftshift(doppler_freqs)
+
+        return np.column_stack([freqs_shifted, psd_shifted])
+
+
+class ResourceScheduler:
+    """优化后的资源调度器"""
+
+    def __init__(self, config: SchedulingConfig = None):
+        self.config = config or SchedulingConfig()
+        self.current_time = 0.0
+        self.task_queue = []
+        self.lock = threading.Lock()
+
+        # 初始化组件
+        self.priority_calculator = PriorityCalculator(self.config)
+        self.strategies = {
+            'priority': PriorityBasedStrategy(self.priority_calculator),
+            'time_pointer': TimePointerStrategy(self.priority_calculator)
+        }
+
+        # 初始化多普勒处理器
+        self.doppler_processor = DopplerProcessor()
+
+        self.logger = logging.getLogger(__name__)
+
+    def schedule_resources(self, tasks: List[RadarTask], strategy: str = "priority",
+                           radar_data: Dict[int, np.ndarray] = None) -> ScheduleResult:
+        """主要的资源调度方法"""
         try:
-            stage1 = self._improved_gsc_sidelobe_suppression(signal)
-            stage2 = self._sum_diff_mainlobe_suppression(stage1)
-            return stage2
-        except Exception as e:
-            print(f"Error in sidelobe suppression: {e}")
-            return signal.copy()
+            if strategy not in self.strategies:
+                raise ValueError(f"Unknown strategy: {strategy}")
 
-    def _improved_gsc_sidelobe_suppression(self, signal: np.ndarray) -> np.ndarray:
-        """改进的GSC旁瓣抑制"""
-        n_aux = 8
-        aux_weights = np.zeros(n_aux, dtype=complex)
-        mu = 0.01
+            # 执行调度
+            result = self.strategies[strategy].schedule(tasks, self.current_time, self.config)
 
-        output = signal.copy()
+            # 如果提供了雷达数据，执行多普勒处理
+            if radar_data:
+                doppler_results = self.doppler_processor.process_doppler_batch(radar_data)
+                result.doppler_results = doppler_results
 
-        for i in range(n_aux, len(signal)):
-            aux_input = signal[i - n_aux:i]
-            error = output[i]
-
-            # 更新权重
-            aux_weights += mu * np.conj(error) * aux_input
-            aux_weights = np.clip(aux_weights.real, -1, 1) + 1j * np.clip(aux_weights.imag, -1, 1)
-
-            # 计算干扰抵消
-            interference = np.sum(aux_weights * aux_input)
-            output[i] = signal[i] - interference
-
-        return output
-
-    def _sum_diff_mainlobe_suppression(self, signal: np.ndarray) -> np.ndarray:
-        """和差主瓣抑制"""
-        sum_weights = np.array([1, 1, 1, 1], dtype=complex)
-        diff_az_weights = np.array([1, -1, 1, -1], dtype=complex)
-        diff_el_weights = np.array([1, 1, -1, -1], dtype=complex)
-
-        output = signal.copy()
-
-        for i in range(0, len(signal) - 4, 4):
-            data_segment = signal[i:i + 4]
-
-            sum_beam = np.sum(sum_weights * data_segment)
-            diff_az = np.sum(diff_az_weights * data_segment)
-            diff_el = np.sum(diff_el_weights * data_segment)
-
-            if abs(sum_beam) > 1e-10:
-                null_angle_az = np.angle(diff_az / sum_beam)
-                null_angle_el = np.angle(diff_el / sum_beam)
-                null_factor = np.exp(-1j * (null_angle_az + null_angle_el))
-
-                output[i:i + 4] = data_segment * null_factor
-
-        return output
-
-    def _pulse_compression(self, signal: np.ndarray) -> np.ndarray:
-        """脉冲压缩"""
-        try:
-            bandwidth = getattr(Config, 'DEFAULT_BANDWIDTH', 10e6)
-            pulse_width = getattr(Config, 'DEFAULT_PULSE_WIDTH', 1e-6)
-            fs = bandwidth * 2
-
-            # 生成LFM参考信号
-            chirp_samples = int(pulse_width * fs)
-            chirp_rate = bandwidth / pulse_width
-
-            lfm_ref = np.zeros(chirp_samples, dtype=complex)
-            for i in range(chirp_samples):
-                t_chirp = i / fs
-                lfm_ref[i] = np.exp(1j * np.pi * chirp_rate * t_chirp ** 2)
-
-            # 执行匹配滤波
-            compressed = np.correlate(signal, np.conj(lfm_ref[::-1]), mode='same')
-            return compressed
+            self.logger.info(f"Scheduled {len(result.scheduled_tasks)} tasks with {strategy} strategy")
+            return result
 
         except Exception as e:
-            print(f"Error in pulse compression: {e}")
-            return signal.copy()
+            self.logger.error(f"Scheduling failed: {e}")
+            raise
 
-    def _cfar_detection(self, signal: np.ndarray, timestamp: float) -> List[Detection]:
-        """CFAR检测"""
-        training_cells = 32
-        guard_cells = 4
-        pfa = 1e-6
+    def add_task(self, task: RadarTask):
+        """线程安全的任务添加"""
+        with self.lock:
+            task.priority = self.priority_calculator.calculate_dynamic_priority(task, self.current_time)
+            heapq.heappush(self.task_queue, (-task.priority, task.task_id, task))
 
-        # 计算CFAR阈值因子
-        alpha = training_cells * (pfa ** (-1 / training_cells) - 1)
+    def get_next_task(self) -> Optional[RadarTask]:
+        """获取下一个最高优先级任务"""
+        with self.lock:
+            if self.task_queue:
+                _, _, task = heapq.heappop(self.task_queue)
+                return task
+            return None
 
-        # 环境自适应调整
-        clutter_density = getattr(self.environment, 'clutter_density', 0.1)
-        interference_level = getattr(self.environment, 'interference_level', 0.0)
+    def update_time(self, new_time: float):
+        """更新当前时间"""
+        if new_time < self.current_time:
+            self.logger.warning("Time going backwards!")
 
-        if clutter_density > 0.5:
-            alpha *= 1.5
-        if interference_level > 0.1:
-            alpha *= 1.3
+        self.current_time = new_time
 
-        detections = []
-        half_window = training_cells // 2 + guard_cells
+        # 重新计算队列中任务的优先级
+        with self.lock:
+            if self.task_queue:
+                tasks = [(task for _, _, task in self.task_queue)]
+                self.task_queue.clear()
+                for task in tasks:
+                    self.add_task(task)
 
-        for i in range(half_window, len(signal) - half_window):
-            try:
-                # 训练数据（排除保护单元）
-                training_data = np.concatenate([
-                    signal[i - half_window:i - guard_cells],
-                    signal[i + guard_cells + 1:i + half_window + 1]
-                ])
+    def get_scheduler_status(self) -> Dict[str, Any]:
+        """获取调度器状态信息"""
+        with self.lock:
+            return {
+                'current_time': self.current_time,
+                'queue_size': len(self.task_queue),
+                'config': self.config,
+                'fft_size': self.doppler_processor.fft_size
+            }
 
-                # 计算噪声功率
-                noise_power = np.mean(np.abs(training_data) ** 2)
-                threshold = alpha * noise_power
-                test_power = abs(signal[i]) ** 2
 
-                if test_power > threshold:
-                    # 计算距离
-                    range_val = i * self.c / (2 * getattr(Config, 'DEFAULT_SAMPLING_RATE', 100e6))
-                    snr = 10 * np.log10(test_power / (noise_power + 1e-10))
+# 使用示例
+if __name__ == "__main__":
+    # 配置日志
+    logging.basicConfig(level=logging.INFO)
 
-                    detection = Detection(
-                        range=range_val,
-                        azimuth=0.0,
-                        elevation=0.0,
-                        velocity=0.0,
-                        snr=snr,
-                        rcs_estimate=0.0,
-                        timestamp=timestamp,
-                        cell_index=i,
-                        low_altitude=(range_val * np.sin(0.0) < 500)
-                    )
-                    detections.append(detection)
-            except Exception as e:
-                print(f"Error in CFAR detection at index {i}: {e}")
-                continue
+    # 创建调度器
+    config = SchedulingConfig(
+        schedule_interval=120.0,
+        priority_weights={'base': 0.4, 'time': 0.4, 'environment': 0.2}
+    )
+    scheduler = ResourceScheduler(config)
 
-        return detections
+    # 创建测试任务
+    tasks = [
+        RadarTask(1, TaskType.TARGET_CONFIRMATION, 10.0, 0.0, 30.0, hard_constraint=True),
+        RadarTask(2, TaskType.HIGH_PRIORITY_TRACKING, 15.0, 5.0, 50.0),
+        RadarTask(3, TaskType.NORMAL_TRACKING, 8.0, 10.0, 60.0)
+    ]
 
-    def _adaptive_doppler_processing(self, detections: List[Detection]) -> List[Detection]:
-        """自适应多普勒处理"""
-        try:
-            prf = getattr(Config, 'DEFAULT_PRF', 1000)
-            n_pulses = 64
+    # 模拟雷达数据
+    radar_data = {
+        1: np.random.complex128(np.random.randn(1024) + 1j * np.random.randn(1024)),
+        2: np.random.complex128(np.random.randn(1024) + 1j * np.random.randn(1024))
+    }
 
-            for detection in detections:
-                # 模拟相位历史
-                phase_history = np.random.random(n_pulses) * 2 * np.pi
-                phase_history_complex = np.exp(1j * phase_history)
+    # 执行调度
+    result = scheduler.schedule_resources(tasks, "priority", radar_data)
 
-                # FFT多普勒处理
-                fft_result = np.fft.fft(phase_history_complex)
-                max_bin = np.argmax(np.abs(fft_result))
-                doppler_freq = (max_bin - n_pulses // 2) * prf / n_pulses
-
-                # 计算径向速度
-                frequency = getattr(self.radar_system, 'frequency', 10e9)
-                detection.velocity = doppler_freq * self.c / (2 * frequency)
-
-        except Exception as e:
-            print(f"Error in Doppler processing: {e}")
-
-        return detections
+    print(f"Scheduled: {len(result.scheduled_tasks)} tasks")
+    print(f"Efficiency: {result.efficiency:.2%}")
+    if result.doppler_results:
+        print(f"Doppler processing completed for {len(result.doppler_results)} targets")
