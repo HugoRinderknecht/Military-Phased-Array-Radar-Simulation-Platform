@@ -39,7 +39,15 @@ class AnalysisService:
         detection_rates = np.array([step.get('avg_detections', 0) for step in time_series.values()])
         detection_variance = np.array([step.get('std_detections', 0) for step in time_series.values()])
 
-        return self._analyze_detection_numba(detection_rates, detection_variance)
+        # 调用修改后的函数
+        mean_rate, stability, peak_rate, slope = self._analyze_detection_numba(detection_rates, detection_variance)
+
+        return {
+            'mean_detection_rate': mean_rate,
+            'detection_stability': stability,
+            'peak_detection_rate': peak_rate,
+            'detection_trend': slope
+        }
 
     def _analyze_tracking_performance(self, results: Dict[str, Any]) -> Dict[str, Any]:
         if 'time_series' not in results:
@@ -49,7 +57,16 @@ class AnalysisService:
         track_counts = np.array([step.get('avg_tracks', 0) for step in time_series.values()])
         confirmed_track_counts = np.array([step.get('avg_confirmed_tracks', 0) for step in time_series.values()])
 
-        return self._analyze_tracking_numba(track_counts, confirmed_track_counts)
+        # 调用修改后的函数
+        mean_tracks, confirmation_rate, stability, mean_confirmed = self._analyze_tracking_numba(track_counts,
+                                                                                                 confirmed_track_counts)
+
+        return {
+            'track_initiation_rate': mean_tracks,
+            'track_confirmation_rate': confirmation_rate,
+            'tracking_stability': stability,
+            'average_confirmed_tracks': mean_confirmed
+        }
 
     def _analyze_resource_utilization(self, results: Dict[str, Any]) -> Dict[str, Any]:
         if 'time_series' not in results:
@@ -58,7 +75,15 @@ class AnalysisService:
         time_series = results['time_series']
         scheduling_efficiencies = np.array([step.get('avg_scheduling_efficiency', 0) for step in time_series.values()])
 
-        return self._analyze_resources_numba(scheduling_efficiencies)
+        # 调用修改后的函数
+        mean_eff, stability, peak_eff, min_eff = self._analyze_resources_numba(scheduling_efficiencies)
+
+        return {
+            'average_scheduling_efficiency': mean_eff,
+            'resource_utilization_stability': stability,
+            'peak_efficiency': peak_eff,
+            'minimum_efficiency': min_eff
+        }
 
     def _calculate_performance_score(self, results: Dict[str, Any]) -> float:
         weights = {
@@ -99,24 +124,38 @@ class AnalysisService:
                 confirmed = np.array([step.get('avg_confirmed_tracks', 0) for step in time_series.values()])
                 efficiencies = np.array([step.get('avg_scheduling_efficiency', 0) for step in time_series.values()])
 
-                metrics['detection_metrics'] = self._calculate_detection_metrics_numba(detections)
-                metrics['tracking_metrics'] = self._calculate_tracking_metrics_numba(tracks, confirmed)
-                metrics['system_metrics'] = self._calculate_system_metrics_numba(efficiencies)
+                # 调用修改后的函数
+                pod, far, consistency = self._calculate_detection_metrics_numba(detections)
+                continuity, accuracy, purity = self._calculate_tracking_metrics_numba(tracks, confirmed)
+                availability, response_time, throughput, reliability = self._calculate_system_metrics_numba(
+                    efficiencies)
+
+                metrics['detection_metrics'] = {
+                    'probability_of_detection': pod,
+                    'false_alarm_rate': far,
+                    'detection_consistency': consistency
+                }
+                metrics['tracking_metrics'] = {
+                    'track_continuity': continuity,
+                    'track_accuracy': accuracy,
+                    'track_purity': purity
+                }
+                metrics['system_metrics'] = {
+                    'system_availability': availability,
+                    'response_time': response_time,
+                    'throughput': throughput,
+                    'reliability_score': reliability
+                }
 
         return metrics
 
     @staticmethod
-    @njit(float64(float64[:], float64[:]), cache=True)
+    @njit(cache=True)
     def _analyze_detection_numba(detection_rates, detection_variance):
         """Numba优化的检测性能分析"""
         n = len(detection_rates)
         if n == 0:
-            return {
-                'mean_detection_rate': 0.0,
-                'detection_stability': 0.0,
-                'peak_detection_rate': 0.0,
-                'detection_trend': 0.0
-            }
+            return (0.0, 0.0, 0.0, 0.0)
 
         mean_rate = np.mean(detection_rates)
         mean_var = np.mean(detection_variance)
@@ -140,25 +179,17 @@ class AnalysisService:
         else:
             slope = (n * sum_xy - sum_x * sum_y) / denominator
 
-        return {
-            'mean_detection_rate': mean_rate,
-            'detection_stability': 1 / (1 + mean_var) if mean_var > 0 else 0.0,
-            'peak_detection_rate': peak_rate,
-            'detection_trend': slope
-        }
+        stability = 1 / (1 + mean_var) if mean_var > 0 else 0.0
+
+        return (mean_rate, stability, peak_rate, slope)
 
     @staticmethod
-    @njit(float64(float64[:], float64[:]), cache=True)
+    @njit(cache=True)
     def _analyze_tracking_numba(track_counts, confirmed_track_counts):
         """Numba优化的跟踪性能分析"""
         n = len(track_counts)
         if n == 0:
-            return {
-                'track_initiation_rate': 0.0,
-                'track_confirmation_rate': 0.0,
-                'tracking_stability': 0.0,
-                'average_confirmed_tracks': 0.0
-            }
+            return (0.0, 0.0, 0.0, 0.0)
 
         mean_tracks = np.mean(track_counts)
         mean_confirmed = np.mean(confirmed_track_counts)
@@ -167,29 +198,20 @@ class AnalysisService:
         std_tracks = np.std(track_counts)
         mean_tracks_nonzero = mean_tracks if mean_tracks > 1e-5 else 1.0
         stability = 1 - (std_tracks / mean_tracks_nonzero)
+        stability = max(min(stability, 1.0), 0.0)
 
         # 计算确认率
         confirmation_rate = mean_confirmed / mean_tracks_nonzero if mean_tracks_nonzero > 0 else 0.0
 
-        return {
-            'track_initiation_rate': mean_tracks,
-            'track_confirmation_rate': confirmation_rate,
-            'tracking_stability': max(min(stability, 1.0), 0.0),
-            'average_confirmed_tracks': mean_confirmed
-        }
+        return (mean_tracks, confirmation_rate, stability, mean_confirmed)
 
     @staticmethod
-    @njit(float64(float64[:]), cache=True)
+    @njit(cache=True)
     def _analyze_resources_numba(scheduling_efficiencies):
         """Numba优化的资源利用分析"""
         n = len(scheduling_efficiencies)
         if n == 0:
-            return {
-                'average_scheduling_efficiency': 0.0,
-                'resource_utilization_stability': 0.0,
-                'peak_efficiency': 0.0,
-                'minimum_efficiency': 0.0
-            }
+            return (0.0, 0.0, 0.0, 0.0)
 
         mean_eff = np.mean(scheduling_efficiencies)
         std_eff = np.std(scheduling_efficiencies)
@@ -199,25 +221,17 @@ class AnalysisService:
         # 计算稳定性
         mean_eff_nonzero = mean_eff if mean_eff > 0.01 else 0.01
         stability = 1 - (std_eff / mean_eff_nonzero)
+        stability = max(min(stability, 1.0), 0.0)
 
-        return {
-            'average_scheduling_efficiency': mean_eff,
-            'resource_utilization_stability': max(min(stability, 1.0), 0.0),
-            'peak_efficiency': peak_eff,
-            'minimum_efficiency': min_eff
-        }
+        return (mean_eff, stability, peak_eff, min_eff)
 
     @staticmethod
-    @njit(float64(float64[:]), cache=True)
+    @njit(cache=True)
     def _calculate_detection_metrics_numba(detections):
         """Numba优化的检测指标计算"""
         n = len(detections)
         if n == 0:
-            return {
-                'probability_of_detection': 0.0,
-                'false_alarm_rate': 0.0,
-                'detection_consistency': 0.0
-            }
+            return (0.0, 0.0, 0.0)
 
         # 概率检测
         pod_sum = 0.0
@@ -233,24 +247,17 @@ class AnalysisService:
         # 一致性
         std_det = np.std(detections)
         consistency = 1 - (std_det / mean_det_nonzero) if mean_det_nonzero > 0 else 0.0
+        consistency = max(min(consistency, 1.0), 0.0)
 
-        return {
-            'probability_of_detection': pod,
-            'false_alarm_rate': far,
-            'detection_consistency': max(min(consistency, 1.0), 0.0)
-        }
+        return (pod, far, consistency)
 
     @staticmethod
-    @njit(float64(float64[:], float64[:]), cache=True)
+    @njit(cache=True)
     def _calculate_tracking_metrics_numba(tracks, confirmed):
         """Numba优化的跟踪指标计算"""
         n = len(tracks)
         if n == 0:
-            return {
-                'track_continuity': 0.0,
-                'track_accuracy': 0.85,
-                'track_purity': 0.90
-            }
+            return (0.0, 0.85, 0.90)  # 默认值
 
         # 跟踪连续性
         continuity_sum = 0.0
@@ -260,34 +267,28 @@ class AnalysisService:
             continuity_sum += c / max(t, 1.0)
         continuity = continuity_sum / n
 
-        return {
-            'track_continuity': continuity,
-            'track_accuracy': 0.85,  # 模拟值
-            'track_purity': 0.90  # 模拟值
-        }
+        # 模拟值
+        accuracy = 0.85
+        purity = 0.90
+
+        return (continuity, accuracy, purity)
 
     @staticmethod
-    @njit(float64(float64[:]), cache=True)
+    @njit(cache=True)
     def _calculate_system_metrics_numba(efficiencies):
         """Numba优化的系统指标计算"""
         n = len(efficiencies)
         if n == 0:
-            return {
-                'system_availability': 0.98,
-                'response_time': 0.06,
-                'throughput': 0.0,
-                'reliability_score': 0.0
-            }
+            return (0.98, 0.06, 0.0, 0.0)  # 默认值
 
         mean_eff = np.mean(efficiencies)
         reliability = min(mean_eff + 0.1, 1.0)
 
-        return {
-            'system_availability': 0.98,  # 模拟值
-            'response_time': 0.06,  # 60ms
-            'throughput': mean_eff,
-            'reliability_score': reliability
-        }
+        # 模拟值
+        availability = 0.98
+        response_time = 0.06  # 60ms
+
+        return (availability, response_time, mean_eff, reliability)
 
     def export_simulation_data(self, results: Dict[str, Any], format_type: str = 'json') -> Dict[str, Any]:
         try:

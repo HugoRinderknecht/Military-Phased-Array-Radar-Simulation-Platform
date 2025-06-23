@@ -172,18 +172,28 @@ class RCSProcessor:
     def _analyze_rcs_features(self, track: Track) -> Dict[str, float]:
         """分析RCS特征"""
         if len(track.rcs_history) < 3:
+            # 返回全零特征字典
             return {'mean': 0, 'std': 0, 'trend': 0, 'max': 0, 'min': 0, 'range': 0}
 
         # 使用有限窗口分析
         window_size = min(self.feature_window, len(track.rcs_history))
         rcs_array = np.array(track.rcs_history[-window_size:])
 
-        return self._compute_features(rcs_array)
+        # 获取特征数组并转换为字典
+        feature_array = self._compute_features(rcs_array)
+        return {
+            'mean': feature_array[0],
+            'std': feature_array[1],
+            'trend': feature_array[2],
+            'max': feature_array[3],
+            'min': feature_array[4],
+            'range': feature_array[5]
+        }
 
     @staticmethod
     @njit(float64[:](float64[:]), cache=True)
-    def _compute_features(rcs_array: np.ndarray) -> Dict[str, float]:
-        """计算特征 (NUMBA加速)"""
+    def _compute_features(rcs_array: np.ndarray) -> np.ndarray:
+        """计算特征 (NUMBA加速) - 返回数组而不是字典"""
         mean = np.mean(rcs_array)
         std = np.std(rcs_array)
         rcs_min = np.min(rcs_array)
@@ -205,11 +215,13 @@ class RCSProcessor:
             denominator = n * sum_x2 - sum_x * sum_x
             trend = numerator / denominator if denominator != 0 else 0.0
 
-        return {
-            'mean': mean,
-            'std': std,
-            'trend': trend,
-            'max': rcs_max,
-            'min': rcs_min,
-            'range': rcs_range
-        }
+        # 将特征值按固定顺序放入数组中
+        features = np.zeros(6)
+        features[0] = mean
+        features[1] = std
+        features[2] = trend
+        features[3] = rcs_max
+        features[4] = rcs_min
+        features[5] = rcs_range
+
+        return features
