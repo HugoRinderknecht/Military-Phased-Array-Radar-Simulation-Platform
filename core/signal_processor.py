@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import scipy.signal
+from scipy import stats
 
 
 class TaskType(Enum):
@@ -17,6 +19,17 @@ class TaskType(Enum):
     WEAK_TARGET_TRACKING = 4
     NORMAL_TRACKING = 5
     AREA_SEARCH = 6
+
+
+@dataclass
+class Detection:
+    """雷达检测结果"""
+    range: float
+    snr: float
+    velocity: float
+    angle: Optional[float] = None
+    amplitude: Optional[float] = None
+    timestamp: Optional[float] = None
 
 
 @dataclass
@@ -59,6 +72,171 @@ class SchedulingConfig:
     })
     time_step: float = 1.0
     max_delay_ratio: float = 0.5
+
+
+class SignalProcessor:
+    """雷达信号处理器"""
+
+    def __init__(self, radar_system, environment):
+        self.radar_system = radar_system
+        self.environment = environment
+        self.c = 299792458.0  # 光速
+
+        # 信号处理参数
+        self.sample_rate = 1e6  # 1 MHz
+        self.pulse_width = 1e-6  # 1 μs
+        self.prf = 1000  # 脉冲重复频率 1 kHz
+
+        # CFAR 参数
+        self.cfar_guard_cells = 4
+        self.cfar_reference_cells = 16
+        self.cfar_threshold_factor = 2.5
+
+        # FFT 设置
+        self.fft_size = 1024
+        self.doppler_processor = DopplerProcessor(self.fft_size)
+
+        self.logger = logging.getLogger(__name__)
+
+    def process_radar_signal(self, signal: np.ndarray, timestamp: float) -> List[Detection]:
+        """处理雷达信号的主要方法"""
+        try:
+            # 1. 自适应杂波抑制
+            clutter_suppressed = self._adaptive_clutter_suppression(signal)
+
+            # 2. 脉冲压缩
+            pulse_compressed = self._pulse_compression(clutter_suppressed)
+
+            # 3. CFAR 检测
+            detections = self._cfar_detection(pulse_compressed, timestamp)
+
+            return detections
+
+        except Exception as e:
+            self.logger.error(f"Signal processing failed: {e}")
+            return []
+
+    def _adaptive_clutter_suppression(self, signal: np.ndarray) -> np.ndarray:
+        """自适应杂波抑制"""
+        # 使用高通滤波器移除低频杂波
+        nyquist = self.sample_rate / 2
+        cutoff = 1000  # 1 kHz 截止频率
+        normalized_cutoff = cutoff / nyquist
+
+        # 设计巴特沃斯高通滤波器
+        b, a = scipy.signal.butter(4, normalized_cutoff, btype='high')
+
+        # 应用滤波器
+        filtered_signal = scipy.signal.filtfilt(b, a, signal.real) + \
+                          1j * scipy.signal.filtfilt(b, a, signal.imag)
+
+        # 自适应权重调整
+        noise_power = np.var(filtered_signal[:100])  # 估计噪声功率
+        adaptive_gain = 1.0 / (1.0 + noise_power)
+
+        return filtered_signal * adaptive_gain
+
+    def _pulse_compression(self, signal: np.ndarray) -> np.ndarray:
+        """脉冲压缩处理"""
+        # 生成匹配滤波器（线性调频脉冲）
+        pulse_samples = int(self.pulse_width * self.sample_rate)
+        t = np.linspace(0, self.pulse_width, pulse_samples)
+
+        # 线性调频参数
+        bandwidth = 10e6  # 10 MHz 带宽
+        chirp_rate = bandwidth / self.pulse_width
+
+        # 生成参考信号（线性调频）
+        reference_pulse = np.exp(1j * np.pi * chirp_rate * t ** 2)
+
+        # 使用 PyFFTW 进行快速卷积
+        if len(signal) >= self.fft_size:
+            # 分段处理长信号
+            compressed_signal = np.zeros_like(signal)
+            step_size = self.fft_size - len(reference_pulse) + 1
+
+            for i in range(0, len(signal) - len(reference_pulse) + 1, step_size):
+                end_idx = min(i + self.fft_size, len(signal))
+                segment = signal[i:end_idx]
+
+                # 使用 scipy 的 correlate 进行匹配滤波
+                segment_compressed = scipy.signal.correlate(segment, reference_pulse, mode='same')
+                compressed_signal[i:i + len(segment_compressed)] = segment_compressed
+
+            return compressed_signal
+        else:
+            # 短信号直接处理
+            return scipy.signal.correlate(signal, reference_pulse, mode='same')
+
+    def _cfar_detection(self, signal: np.ndarray, timestamp: float) -> List[Detection]:
+        """恒虚警率(CFAR)检测"""
+        detections = []
+        signal_power = np.abs(signal) ** 2
+
+        # CFAR 滑窗检测
+        total_cells = 2 * (self.cfar_guard_cells + self.cfar_reference_cells)
+
+        for i in range(total_cells, len(signal_power) - total_cells):
+            # 计算保护单元和参考单元的索引
+            left_ref_start = i - self.cfar_guard_cells - self.cfar_reference_cells
+            left_ref_end = i - self.cfar_guard_cells
+            right_ref_start = i + self.cfar_guard_cells + 1
+            right_ref_end = i + self.cfar_guard_cells + self.cfar_reference_cells + 1
+
+            # 计算参考单元的平均功率
+            left_ref_power = np.mean(signal_power[left_ref_start:left_ref_end])
+            right_ref_power = np.mean(signal_power[right_ref_start:right_ref_end])
+            reference_power = (left_ref_power + right_ref_power) / 2
+
+            # CFAR 门限
+            threshold = self.cfar_threshold_factor * reference_power
+
+            # 检测判决
+            if signal_power[i] > threshold:
+                # 计算检测参数
+                range_val = self._calculate_range(i)
+                snr = 10 * np.log10(signal_power[i] / reference_power)
+                velocity = self._estimate_velocity(signal, i)
+
+                detection = Detection(
+                    range=range_val,
+                    snr=snr,
+                    velocity=velocity,
+                    amplitude=np.abs(signal[i]),
+                    timestamp=timestamp
+                )
+                detections.append(detection)
+
+        return detections
+
+    def _calculate_range(self, sample_index: int) -> float:
+        """根据采样索引计算距离"""
+        time_delay = sample_index / self.sample_rate
+        range_val = self.c * time_delay / 2  # 双程时间
+        return range_val
+
+    def _estimate_velocity(self, signal: np.ndarray, center_index: int) -> float:
+        """估计多普勒速度"""
+        # 提取局部信号段进行多普勒分析
+        window_size = min(64, len(signal) - center_index, center_index)
+        start_idx = max(0, center_index - window_size // 2)
+        end_idx = min(len(signal), center_index + window_size // 2)
+
+        local_signal = signal[start_idx:end_idx]
+
+        # 使用 FFT 估计多普勒频移
+        fft_result = np.fft.fft(local_signal)
+        fft_power = np.abs(fft_result) ** 2
+
+        # 找到峰值频率
+        peak_idx = np.argmax(fft_power)
+        doppler_freq = np.fft.fftfreq(len(local_signal), 1 / self.sample_rate)[peak_idx]
+
+        # 将多普勒频移转换为径向速度
+        wavelength = self.c / self.radar_system.frequency
+        velocity = doppler_freq * wavelength / 2
+
+        return velocity
 
 
 class PriorityCalculator:
@@ -275,28 +453,34 @@ class DopplerProcessor:
 
     def _setup_fftw(self):
         """设置PyFFTW"""
-        # 启用多线程
-        pyfftw.config.NUM_THREADS = self.num_threads
-        pyfftw.config.PLANNER_EFFORT = 'FFTW_MEASURE'
+        try:
+            # 启用多线程
+            pyfftw.config.NUM_THREADS = self.num_threads
+            pyfftw.config.PLANNER_EFFORT = 'FFTW_MEASURE'
 
-        # 预分配数组和创建FFT对象
-        self.input_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
-        self.output_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
+            # 预分配数组和创建FFT对象
+            self.input_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
+            self.output_array = pyfftw.empty_aligned(self.fft_size, dtype='complex128')
 
-        # 创建FFTW对象（会自动优化）
-        self.fft_forward = pyfftw.FFTW(
-            self.input_array, self.output_array,
-            direction='FFTW_FORWARD',
-            flags=('FFTW_MEASURE',),
-            threads=self.num_threads
-        )
+            # 创建FFTW对象（会自动优化）
+            self.fft_forward = pyfftw.FFTW(
+                self.input_array, self.output_array,
+                direction='FFTW_FORWARD',
+                flags=('FFTW_MEASURE',),
+                threads=self.num_threads
+            )
 
-        self.fft_backward = pyfftw.FFTW(
-            self.output_array, self.input_array,
-            direction='FFTW_BACKWARD',
-            flags=('FFTW_MEASURE',),
-            threads=self.num_threads
-        )
+            self.fft_backward = pyfftw.FFTW(
+                self.output_array, self.input_array,
+                direction='FFTW_BACKWARD',
+                flags=('FFTW_MEASURE',),
+                threads=self.num_threads
+            )
+        except Exception as e:
+            self.logger.warning(f"PyFFTW setup failed, falling back to numpy FFT: {e}")
+            self.use_numpy_fft = True
+        else:
+            self.use_numpy_fft = False
 
     def process_doppler_batch(self, radar_data: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
         """批量处理多普勒数据"""
@@ -330,15 +514,19 @@ class DopplerProcessor:
             else:
                 data = data[:self.fft_size]
 
-        # 将数据复制到预分配的数组中
-        self.input_array[:] = data
-
-        # 执行FFT
-        self.fft_forward()
+        if self.use_numpy_fft:
+            # 使用 numpy FFT 作为后备
+            fft_result = np.fft.fft(data)
+        else:
+            # 将数据复制到预分配的数组中
+            self.input_array[:] = data
+            # 执行FFT
+            self.fft_forward()
+            fft_result = self.output_array.copy()
 
         # 应用窗函数（汉明窗）
         window = np.hamming(self.fft_size)
-        windowed_result = self.output_array * window
+        windowed_result = fft_result * window
 
         # 计算功率谱密度
         psd = np.abs(windowed_result) ** 2
@@ -421,7 +609,7 @@ class ResourceScheduler:
         # 重新计算队列中任务的优先级
         with self.lock:
             if self.task_queue:
-                tasks = [(task for _, _, task in self.task_queue)]
+                tasks = [task for _, _, task in self.task_queue]
                 self.task_queue.clear()
                 for task in tasks:
                     self.add_task(task)
@@ -458,8 +646,8 @@ if __name__ == "__main__":
 
     # 模拟雷达数据
     radar_data = {
-        1: np.random.complex128(np.random.randn(1024) + 1j * np.random.randn(1024)),
-        2: np.random.complex128(np.random.randn(1024) + 1j * np.random.randn(1024))
+        1: np.random.random(1024) + 1j * np.random.random(1024),
+        2: np.random.random(1024) + 1j * np.random.random(1024)
     }
 
     # 执行调度

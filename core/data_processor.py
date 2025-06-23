@@ -8,6 +8,18 @@ import logging
 from dataclasses import dataclass
 from collections import deque
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import hashlib
+
+# 性能优化导入
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+from numba import jit, prange
+import psutil
+import threading
+from threading import RLock
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +37,29 @@ class ProcessingMetrics:
     memory_usage: float = 0.0
 
 
-class DataProcessor:
-    """增强的数据处理器 - 集成目标跟踪和可视化数据处理"""
+@jit(nopython=True)
+def _calculate_distances_fast(track_positions: np.ndarray, det_positions: np.ndarray) -> np.ndarray:
+    """JIT编译的快速距离计算"""
+    n_tracks, n_dets = track_positions.shape[0], det_positions.shape[0]
+    distances = np.zeros((n_tracks, n_dets))
+
+    for i in prange(n_tracks):
+        for j in range(n_dets):
+            dx = track_positions[i, 0] - det_positions[j, 0]
+            dy = track_positions[i, 1] - det_positions[j, 1]
+            distances[i, j] = np.sqrt(dx * dx + dy * dy)
+
+    return distances
+
+
+@jit(nopython=True)
+def _vectorized_gate_check(distances: np.ndarray, gate_threshold: float) -> np.ndarray:
+    """向量化的门限检查"""
+    return (distances < gate_threshold).astype(np.int32)
+
+
+class OptimizedDataProcessor:
+    """优化的数据处理器 - 提升性能和内存效率"""
 
     def __init__(self, radar_system: RadarSystem, environment: Environment):
         self.radar_system = radar_system
@@ -35,11 +68,20 @@ class DataProcessor:
         self.svm_filter = SVMClutterFilter()
         self.track_id_counter = 1
 
-        # 新增：性能监控和数据缓存
+        # 线程安全
+        self._lock = RLock()
+        self._thread_pool = ThreadPoolExecutor(max_workers=4)
+
+        # 性能监控和数据缓存
         self.processing_metrics = ProcessingMetrics()
-        self.detection_history = deque(maxlen=1000)
-        self.track_history = deque(maxlen=1000)
-        self.metrics_history = deque(maxlen=100)
+        self.detection_history = deque(maxlen=100)  # 减少内存占用
+        self.track_history = deque(maxlen=100)
+        self.metrics_history = deque(maxlen=50)
+
+        # 缓存系统
+        self._distance_cache = {}
+        self._cluster_cache = {}
+        self._cache_max_size = 1000
 
         # 配置参数
         self.max_tracks = 500
@@ -47,48 +89,93 @@ class DataProcessor:
         self.track_max_age = 10
         self.track_confirmation_threshold = 3
 
-        logger.info("DataProcessor initialized with enhanced capabilities")
+        # 预分配数组以减少内存分配
+        self._temp_positions = np.zeros((self.max_tracks, 2))
+        self._temp_distances = np.zeros((self.max_tracks, self.max_tracks))
 
-    def process_tracking_data(self, detections: List[Detection], timestamp: float = None) -> Dict[str, Any]:
-        """
-        增强的跟踪数据处理 - 返回完整的处理结果
-        """
+        logger.info("OptimizedDataProcessor initialized with enhanced performance")
+
+    async def process_tracking_data_async(self, detections: List[Detection],
+                                          timestamp: float = None) -> Dict[str, Any]:
+        """异步数据处理"""
         start_time = time.time()
 
         if timestamp is None:
             timestamp = time.time()
 
         try:
-            # 原有的处理逻辑
-            clusters = self._cluster_detections(detections)
-            filtered_detections = self._tomht_svm_tracking(clusters)
+            # 并行处理任务
+            tasks = [
+                asyncio.create_task(self._cluster_detections_async(detections)),
+                asyncio.create_task(self._update_metrics_async()),
+                asyncio.create_task(self._cleanup_tracks_async())
+            ]
 
-            # 跟踪更新
-            for track in self.tracks:
-                track.predict(0.06)
-                if self.environment.weather.weather_type in ["heavy_rain", "snow"]:
-                    self._apply_imm_tracking([track])
+            cluster_result, metrics_result, cleanup_result = await asyncio.gather(*tasks)
 
-            # 低空目标增强
-            self._enhance_low_altitude_targets()
+            # 继续处理
+            filtered_detections = await self._tomht_svm_tracking_async(cluster_result)
 
             # 更新历史记录
-            self._update_history(detections, timestamp)
+            await self._update_history_async(detections, timestamp)
 
-            # 计算性能指标
             processing_time = time.time() - start_time
-            self._update_metrics(detections, processing_time)
 
-            # 返回完整的处理结果
             return {
                 'timestamp': timestamp,
                 'detections': self._format_detections(filtered_detections),
                 'tracks': self._format_tracks(),
-                'clusters': self._format_clusters(clusters),
+                'clusters': self._format_clusters(cluster_result),
                 'metrics': self._get_current_metrics(),
                 'processing_time': processing_time,
                 'status': 'success'
             }
+
+        except Exception as e:
+            logger.error(f"Error in async tracking data processing: {str(e)}")
+            return {
+                'timestamp': timestamp,
+                'error': str(e),
+                'status': 'error'
+            }
+
+    def process_tracking_data(self, detections: List[Detection],
+                              timestamp: float = None) -> Dict[str, Any]:
+        """同步数据处理（保持向后兼容）"""
+        start_time = time.time()
+
+        if timestamp is None:
+            timestamp = time.time()
+
+        try:
+            with self._lock:
+                # 使用优化的聚类算法
+                clusters = self._cluster_detections(detections)
+                filtered_detections = self._tomht_svm_tracking(clusters)
+
+                # 航迹预测
+                self._predict_tracks()
+
+                # 并行更新航迹
+                self._update_tracks(filtered_detections)
+
+                # 低空目标增强
+                self._enhance_low_altitude_targets()
+
+                # 更新历史记录和指标
+                self._update_history(detections, timestamp)
+                processing_time = time.time() - start_time
+                self._update_metrics(detections, processing_time)
+
+                return {
+                    'timestamp': timestamp,
+                    'detections': self._format_detections(filtered_detections),
+                    'tracks': self._format_tracks(),
+                    'clusters': self._format_clusters(clusters),
+                    'metrics': self._get_current_metrics(),
+                    'processing_time': processing_time,
+                    'status': 'success'
+                }
 
         except Exception as e:
             logger.error(f"Error in tracking data processing: {str(e)}")
@@ -98,38 +185,21 @@ class DataProcessor:
                 'status': 'error'
             }
 
-    def get_visualization_data(self, data_type: str = 'all') -> Dict[str, Any]:
-        """
-        获取可视化数据 - 为前端提供格式化的数据
-        """
-        try:
-            if data_type == 'radar_display':
-                return self._get_radar_display_data()
-            elif data_type == 'performance':
-                return self._get_performance_data()
-            elif data_type == 'tracks':
-                return self._get_tracks_data()
-            elif data_type == 'detections':
-                return self._get_detections_data()
-            elif data_type == 'all':
-                return {
-                    'radar_display': self._get_radar_display_data(),
-                    'performance': self._get_performance_data(),
-                    'tracks': self._get_tracks_data(),
-                    'detections': self._get_detections_data()
-                }
-            else:
-                raise ValueError(f"Unknown data type: {data_type}")
-
-        except Exception as e:
-            logger.error(f"Error getting visualization data: {str(e)}")
-            return {'error': str(e)}
-
     def _cluster_detections(self, detections: List[Detection]) -> List[List[Detection]]:
-        """聚类检测点"""
+        """聚类检测点（兼容原接口）"""
+        return self._cluster_detections_optimized(detections)
+
+    def _cluster_detections_optimized(self, detections: List[Detection]) -> List[List[Detection]]:
+        """优化的聚类算法"""
         if len(detections) < 2:
             return [[det] for det in detections]
 
+        # 检查缓存
+        detection_hash = self._get_detection_hash(detections)
+        if detection_hash in self._cluster_cache:
+            return self._cluster_cache[detection_hash]
+
+        # 向量化位置计算
         positions = np.array([
             [det.range * np.cos(det.azimuth), det.range * np.sin(det.azimuth)]
             for det in detections
@@ -137,16 +207,25 @@ class DataProcessor:
 
         # 动态调整聚类参数
         eps = self._calculate_dynamic_eps(detections)
+
+        # 使用优化的DBSCAN
         clustering = DBSCAN(eps=eps, min_samples=1).fit(positions)
         labels = clustering.labels_
 
+        # 快速分组
         clusters = {}
         for i, label in enumerate(labels):
             if label not in clusters:
                 clusters[label] = []
             clusters[label].append(detections[i])
 
-        return list(clusters.values())
+        result = list(clusters.values())
+
+        # 缓存结果
+        if len(self._cluster_cache) < self._cache_max_size:
+            self._cluster_cache[detection_hash] = result
+
+        return result
 
     def _calculate_dynamic_eps(self, detections: List[Detection]) -> float:
         """动态计算聚类参数"""
@@ -165,7 +244,7 @@ class DataProcessor:
             return 200.0
 
     def _tomht_svm_tracking(self, clusters: List[List[Detection]]) -> List[Detection]:
-        """TOMHT-SVM跟踪算法"""
+        """TOMHT-SVM跟踪算法（兼容原接口）"""
         all_detections = [det for cluster in clusters for det in cluster]
 
         # SVM训练和预测
@@ -185,9 +264,6 @@ class DataProcessor:
             if prediction == 1:
                 filtered_detections.append(detection)
 
-        # 更新跟踪
-        self._update_tracks(filtered_detections)
-
         return filtered_detections
 
     def _is_detection_associated_with_track(self, detection: Detection) -> bool:
@@ -204,9 +280,21 @@ class DataProcessor:
 
         return False
 
+    def _predict_tracks(self):
+        """预测所有航迹状态"""
+        dt = 0.06
+        for track in self.tracks:
+            track.predict(dt)
+            if self.environment.weather.weather_type in ["heavy_rain", "snow"]:
+                self._apply_imm_tracking([track])
+
     def _update_tracks(self, detections: List[Detection]):
         """更新航迹"""
         if not detections:
+            # 没有检测时，只增加航迹年龄并清理过期航迹
+            for track in self.tracks:
+                track.age += 1
+            self._cleanup_tracks()
             return
 
         association_matrix = self._build_association_matrix(detections)
@@ -223,6 +311,8 @@ class DataProcessor:
                 used_detections.add(best_det_idx)
                 if track.age >= self.track_confirmation_threshold:
                     track.confirmed = True
+            else:
+                track.age += 1
 
         # 创建新航迹
         self._create_new_tracks(detections, used_detections)
@@ -402,6 +492,80 @@ class DataProcessor:
         accurate_tracks = sum(1 for track in self.tracks if track.score > 0.8)
         return accurate_tracks / len(self.tracks)
 
+    def _get_detection_hash(self, detections: List[Detection]) -> str:
+        """生成检测数据的哈希值用于缓存"""
+        try:
+            # 使用更安全的哈希方法
+            data_str = str([(round(d.range, 1), round(d.azimuth, 3), round(d.elevation, 3))
+                            for d in detections[:50]])  # 限制数据量
+            return hashlib.md5(data_str.encode()).hexdigest()
+        except Exception:
+            # 简化的哈希方法作为后备
+            return str(len(detections))
+
+    # 异步方法实现
+    async def _cluster_detections_async(self, detections: List[Detection]) -> List[List[Detection]]:
+        """异步聚类检测"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._thread_pool,
+            self._cluster_detections_optimized,
+            detections
+        )
+
+    async def _tomht_svm_tracking_async(self, clusters: List[List[Detection]]) -> List[Detection]:
+        """异步TOMHT-SVM跟踪"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._thread_pool,
+            self._tomht_svm_tracking,
+            clusters
+        )
+
+    async def _update_metrics_async(self):
+        """异步更新指标"""
+        await asyncio.sleep(0)  # 让出控制权
+        try:
+            process = psutil.Process()
+            self.processing_metrics.cpu_usage = process.cpu_percent()
+            self.processing_metrics.memory_usage = process.memory_percent()
+        except Exception:
+            # 如果psutil不可用，使用默认值
+            pass
+
+    async def _cleanup_tracks_async(self):
+        """异步清理航迹"""
+        await asyncio.sleep(0)  # 让出控制权
+        self._cleanup_tracks()
+
+    async def _update_history_async(self, detections: List[Detection], timestamp: float):
+        """异步更新历史记录"""
+        await asyncio.sleep(0)  # 让出控制权
+        self._update_history(detections, timestamp)
+
+    def clear_cache(self):
+        """清理缓存"""
+        self._distance_cache.clear()
+        self._cluster_cache.clear()
+        logger.info("Cache cleared")
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """获取缓存统计信息"""
+        return {
+            'distance_cache_size': len(self._distance_cache),
+            'cluster_cache_size': len(self._cluster_cache),
+            'max_cache_size': self._cache_max_size
+        }
+
+    def __del__(self):
+        """析构函数 - 清理资源"""
+        try:
+            if hasattr(self, '_thread_pool'):
+                self._thread_pool.shutdown(wait=False)
+        except Exception:
+            pass
+
+    # 保持原有的格式化和获取数据方法
     def _format_detections(self, detections: List[Detection]) -> List[Dict]:
         """格式化检测数据"""
         return [{
@@ -465,13 +629,50 @@ class DataProcessor:
             'z': np.mean(z_coords)
         }
 
+    def _get_current_metrics(self) -> Dict[str, Any]:
+        """获取当前指标"""
+        return {
+            'detection_count': self.processing_metrics.detection_count,
+            'track_count': self.processing_metrics.track_count,
+            'processing_time': self.processing_metrics.processing_time,
+            'cluster_count': self.processing_metrics.cluster_count,
+            'false_alarm_rate': self.processing_metrics.false_alarm_rate,
+            'track_accuracy': self.processing_metrics.track_accuracy
+        }
+
+    def get_visualization_data(self, data_type: str = 'all') -> Dict[str, Any]:
+        """获取可视化数据"""
+        try:
+            if data_type == 'radar_display':
+                return self._get_radar_display_data()
+            elif data_type == 'performance':
+                return self._get_performance_data()
+            elif data_type == 'tracks':
+                return self._get_tracks_data()
+            elif data_type == 'detections':
+                return self._get_detections_data()
+            elif data_type == 'all':
+                return {
+                    'radar_display': self._get_radar_display_data(),
+                    'performance': self._get_performance_data(),
+                    'tracks': self._get_tracks_data(),
+                    'detections': self._get_detections_data(),
+                    'cache_stats': self.get_cache_stats()
+                }
+            else:
+                raise ValueError(f"Unknown data type: {data_type}")
+
+        except Exception as e:
+            logger.error(f"Error(e)")
+            return {'error': str(e)}
+
     def _get_radar_display_data(self) -> Dict[str, Any]:
         """获取雷达显示数据"""
         return {
             'scan_angle': self.radar_system.antenna.current_angle,
             'max_range': self.radar_system.max_range,
             'targets': self._format_tracks(),
-            'detections': self._format_detections([]),  # 当前帧检测
+            'detections': [],  # 当前帧检测
             'clutter_level': self.environment.clutter_density,
             'weather_impact': self._get_weather_impact()
         }
@@ -545,17 +746,6 @@ class DataProcessor:
         snr_values = [det.snr for det in detections if hasattr(det, 'snr')]
         return np.mean(snr_values) if snr_values else 0.0
 
-    def _get_current_metrics(self) -> Dict[str, Any]:
-        """获取当前指标"""
-        return {
-            'detection_count': self.processing_metrics.detection_count,
-            'track_count': self.processing_metrics.track_count,
-            'processing_time': self.processing_metrics.processing_time,
-            'cluster_count': self.processing_metrics.cluster_count,
-            'false_alarm_rate': self.processing_metrics.false_alarm_rate,
-            'track_accuracy': self.processing_metrics.track_accuracy
-        }
-
     def get_historical_data(self, start_time: float, end_time: float) -> Dict[str, Any]:
         """获取历史数据"""
         filtered_detections = [
@@ -582,10 +772,16 @@ class DataProcessor:
 
     def reset(self):
         """重置处理器状态"""
-        self.tracks.clear()
-        self.track_id_counter = 1
-        self.detection_history.clear()
-        self.track_history.clear()
-        self.metrics_history.clear()
-        self.processing_metrics = ProcessingMetrics()
-        logger.info("DataProcessor reset completed")
+        with self._lock:
+            self.tracks.clear()
+            self.track_id_counter = 1
+            self.detection_history.clear()
+            self.track_history.clear()
+            self.metrics_history.clear()
+            self.clear_cache()
+            self.processing_metrics = ProcessingMetrics()
+            logger.info("OptimizedDataProcessor reset completed")
+
+
+# 为了向后兼容，保持原类名的别名
+DataProcessor = OptimizedDataProcessor

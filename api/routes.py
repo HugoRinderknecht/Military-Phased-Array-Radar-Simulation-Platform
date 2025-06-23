@@ -271,6 +271,7 @@ def analyze_results():
         'message': 'Analysis completed successfully'
     })
 
+
 # === 数据导出接口 ===
 
 @api_bp.route('/export/start', methods=['POST'])
@@ -314,17 +315,18 @@ def download_export_file(export_id):
 @handle_api_error
 def get_system_info():
     """获取系统信息"""
-    info = {
-        'version': '1.0.0',
-        'api_version': '1.0',
-        'server_time': datetime.now().isoformat(),
-        'active_simulations': simulation_service.get_active_simulation_count(),
-        'system_status': 'running'
-    }
-    return jsonify({
-        'status': 'success',
-        'data': info
-    })
+    try:
+        info = {
+            'version': '1.0.0',
+            'api_version': '1.0',
+            'server_time': datetime.now().isoformat(),
+            'active_simulations': simulation_service.get_active_simulation_count(),
+            'system_status': 'running'
+        }
+        return jsonify({'status': 'success', 'data': info})
+    except Exception as e:
+        logger.error(f"Failed to fetch system info: {str(e)}")
+        raise  # 触发装饰器的500处理
 
 
 @api_bp.route('/health', methods=['GET'])
@@ -364,11 +366,15 @@ def run_simulation():
 @handle_api_error
 def get_status():
     """获取仿真状态（兼容性保留）"""
-    status = simulation_service.get_legacy_status()
-    return jsonify({
-        'status': 'success',
-        'data': status
-    })
+    try:
+        status = simulation_service.get_legacy_status()
+        return jsonify({
+            'status': 'success',
+            'data': status
+        })
+    except Exception as e:
+        logger.error(f"Failed to fetch legacy status: {str(e)}")
+        raise  # 触发装饰器的500处理
 
 
 @api_bp.route('/reset', methods=['POST'])

@@ -1,20 +1,34 @@
-import numpy as np
 import logging
 from typing import List, Dict, Any, Optional
+
+import numpy as np
+
+from core.data_processor import DataProcessor
+from core.rcs_processor import RCSProcessor
+from core.resource_scheduler import ResourceScheduler, RadarTask, TaskType
+from core.signal_processor import SignalProcessor
+from models.environment import Environment, WeatherCondition
 from models.radar_system import RadarSystem, SimulationParameters
 from models.target import Target, Formation
-from models.environment import Environment, WeatherCondition
-from models.tracking import Detection
-from core.signal_processor import SignalProcessor
-from core.data_processor import DataProcessor
-from core.resource_scheduler import ResourceScheduler, RadarTask, TaskType
-from core.rcs_processor import RCSProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class SimulationService:
     def __init__(self):
+        # 首先初始化所有必要的属性
+        self.signal_processor = None
+        self.data_processor = None
+        self.resource_scheduler = None
+        self.rcs_processor = None
+        self.current_time = 0.0
+        self.simulation_data = []
+        self.targets = []
+        self.formations = []
+        self.simulation_params = None
+        self._active_simulations = {}
+
+        # 然后调用重置方法
         self.reset_simulation()
 
     def reset_simulation(self):
@@ -24,10 +38,43 @@ class SimulationService:
         self.targets = []
         self.formations = []
         self.simulation_params = None
+
+        # 安全地清除处理器状态
+        if hasattr(self, 'signal_processor') and self.signal_processor and hasattr(self.signal_processor,
+                                                                                   'clear_state'):
+            try:
+                self.signal_processor.clear_state()
+            except Exception as e:
+                logger.warning(f"Error clearing signal processor state: {str(e)}")
+
+        if hasattr(self, 'data_processor') and self.data_processor and hasattr(self.data_processor, 'clear_state'):
+            try:
+                self.data_processor.clear_state()
+            except Exception as e:
+                logger.warning(f"Error clearing data processor state: {str(e)}")
+
+        if hasattr(self, 'resource_scheduler') and self.resource_scheduler and hasattr(self.resource_scheduler,
+                                                                                       'clear_state'):
+            try:
+                self.resource_scheduler.clear_state()
+            except Exception as e:
+                logger.warning(f"Error clearing resource scheduler state: {str(e)}")
+
+        if hasattr(self, 'rcs_processor') and self.rcs_processor and hasattr(self.rcs_processor, 'clear_state'):
+            try:
+                self.rcs_processor.clear_state()
+            except Exception as e:
+                logger.warning(f"Error clearing RCS processor state: {str(e)}")
+
+        # 重置处理器为 None
         self.signal_processor = None
         self.data_processor = None
         self.resource_scheduler = None
         self.rcs_processor = None
+
+        # 清除活跃仿真跟踪
+        if hasattr(self, '_active_simulations'):
+            self._active_simulations.clear()
 
     def initialize_simulation(self, parameters: Dict[str, Any], simulation_id: str = None) -> Dict[str, Any]:
         """初始化仿真"""
@@ -677,24 +724,259 @@ class SimulationService:
                 'time_series': {}
             }
 
-    def get_simulation_status(self, simulation_id: str = None) -> Dict[str, Any]:
-        """获取仿真状态"""
-        return {
-            'current_time': self.current_time,
-            'is_running': hasattr(self, 'simulation_params') and self.simulation_params is not None,
-            'num_targets': len(getattr(self, 'targets', [])),
-            'num_formations': len(getattr(self, 'formations', [])),
-            'simulation_id': simulation_id
-        }
+    def get_active_simulation_count(self):
+        """返回活跃仿真数量"""
+        try:
+            # 如果有活跃仿真的跟踪机制，返回实际数量
+            if hasattr(self, '_active_simulations'):
+                return len(self._active_simulations)
+
+            # 简化实现：检查是否有当前运行的仿真
+            if hasattr(self, 'simulation_params') and self.simulation_params is not None:
+                return 1
+
+            return 0
+        except Exception as e:
+            logger.error(f"Error getting active simulation count: {str(e)}")
+            return 0
+
+    def get_legacy_status(self):
+        """兼容旧版状态接口"""
+        try:
+            is_running = hasattr(self, 'simulation_params') and self.simulation_params is not None
+
+            status_data = {
+                'status': 'running' if is_running else 'idle',
+                'current_time': getattr(self, 'current_time', 0.0),
+                'simulations': [],
+                'active_count': self.get_active_simulation_count()
+            }
+
+            # 如果有活跃仿真，添加基本信息
+            if is_running:
+                status_data['simulations'].append({
+                    'id': 'default',
+                    'status': 'running',
+                    'current_time': self.current_time,
+                    'targets': len(getattr(self, 'targets', [])),
+                    'formations': len(getattr(self, 'formations', []))
+                })
+
+            return status_data
+        except Exception as e:
+            logger.error(f"Error getting legacy status: {str(e)}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'simulations': [],
+                'active_count': 0
+            }
+
+    def reset_all_simulations(self):
+        """重置所有仿真"""
+        try:
+            # 重置仿真状态
+            self.reset_simulation()
+
+            # 清空活跃仿真跟踪
+            if hasattr(self, '_active_simulations'):
+                self._active_simulations.clear()
+
+            logger.info("All simulations have been reset successfully")
+            return {
+                'status': 'success',
+                'message': 'All simulations have been reset',
+                'active_simulations': 0
+            }
+        except Exception as e:
+            logger.error(f"Error resetting all simulations: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Failed to reset simulations: {str(e)}'
+            }
+
+    def start_async_simulation(self, simulation_id: str):
+        """启动异步仿真任务"""
+        try:
+            # 初始化活跃仿真跟踪
+            if not hasattr(self, '_active_simulations'):
+                self._active_simulations = {}
+
+            # 记录仿真开始
+            self._active_simulations[simulation_id] = {
+                'status': 'running',
+                'start_time': self.current_time,
+                'simulation_params': self.simulation_params
+            }
+
+            return {
+                'simulation_id': simulation_id,
+                'status': 'started',
+                'message': 'Async simulation task initiated'
+            }
+        except Exception as e:
+            logger.error(f"Error starting async simulation {simulation_id}: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Failed to start async simulation: {str(e)}'
+            }
+
+    def pause_simulation(self, simulation_id: str):
+        """暂停仿真"""
+        try:
+            if hasattr(self, '_active_simulations') and simulation_id in self._active_simulations:
+                self._active_simulations[simulation_id]['status'] = 'paused'
+                return {
+                    'simulation_id': simulation_id,
+                    'status': 'paused',
+                    'message': 'Simulation paused successfully'
+                }
+            else:
+                return {
+                    'status': 'error',
+                    'message': f'Simulation {simulation_id} not found or not active'
+                }
+        except Exception as e:
+            logger.error(f"Error pausing simulation {simulation_id}: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Failed to pause simulation: {str(e)}'
+            }
+
+    def resume_simulation(self, simulation_id: str):
+        """恢复仿真"""
+        try:
+            if hasattr(self, '_active_simulations') and simulation_id in self._active_simulations:
+                self._active_simulations[simulation_id]['status'] = 'running'
+                return {
+                    'simulation_id': simulation_id,
+                    'status': 'running',
+                    'message': 'Simulation resumed successfully'
+                }
+            else:
+                return {
+                    'status': 'error',
+                    'message': f'Simulation {simulation_id} not found or not active'
+                }
+        except Exception as e:
+            logger.error(f"Error resuming simulation {simulation_id}: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Failed to resume simulation: {str(e)}'
+            }
+
+    def get_simulation_data(self, simulation_id: str, start_time: float = 0.0,
+                            end_time: float = None, data_types: List[str] = None):
+        """获取仿真数据"""
+        try:
+            # 检查仿真是否存在
+            if hasattr(self, '_active_simulations') and simulation_id not in self._active_simulations:
+                raise ValueError(f"Simulation {simulation_id} not found")
+
+            # 获取仿真数据
+            if not hasattr(self, 'simulation_data') or not self.simulation_data:
+                return {
+                    'simulation_id': simulation_id,
+                    'data': [],
+                    'message': 'No data available'
+                }
+
+            filtered_data = []
+            for data_point in self.simulation_data:
+                data_time = data_point.get('time', 0.0)
+
+                # 时间过滤
+                if data_time < start_time:
+                    continue
+                if end_time is not None and data_time > end_time:
+                    continue
+
+                # 数据类型过滤
+                if data_types:
+                    filtered_point = {'time': data_time}
+                    for data_type in data_types:
+                        if data_type in data_point:
+                            filtered_point[data_type] = data_point[data_type]
+                    filtered_data.append(filtered_point)
+                else:
+                    filtered_data.append(data_point)
+
+            return {
+                'simulation_id': simulation_id,
+                'data': filtered_data,
+                'start_time': start_time,
+                'end_time': end_time,
+                'data_types': data_types
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting simulation data for {simulation_id}: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Failed to get simulation data: {str(e)}'
+            }
 
     def stop_simulation(self, simulation_id: str = None) -> Dict[str, Any]:
         """停止仿真"""
         try:
-            self.reset_simulation()
-            return {"status": "success", "message": "Simulation stopped successfully"}
+            if simulation_id:
+                # 停止特定仿真
+                if hasattr(self, '_active_simulations') and simulation_id in self._active_simulations:
+                    del self._active_simulations[simulation_id]
+                    return {
+                        "status": "success",
+                        "message": f"Simulation {simulation_id} stopped successfully"
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"Simulation {simulation_id} not found"
+                    }
+            else:
+                # 停止所有仿真
+                self.reset_simulation()
+                if hasattr(self, '_active_simulations'):
+                    self._active_simulations.clear()
+                return {"status": "success", "message": "All simulations stopped successfully"}
+
         except Exception as e:
             logger.error(f"Error stopping simulation: {str(e)}")
             return {"status": "error", "message": f"Failed to stop simulation: {str(e)}"}
+
+    def get_simulation_status(self, simulation_id: str = None) -> Dict[str, Any]:
+        """获取仿真状态"""
+        try:
+            if simulation_id:
+                # 获取特定仿真状态
+                if hasattr(self, '_active_simulations') and simulation_id in self._active_simulations:
+                    sim_info = self._active_simulations[simulation_id]
+                    return {
+                        'simulation_id': simulation_id,
+                        'status': sim_info.get('status', 'unknown'),
+                        'current_time': self.current_time,
+                        'start_time': sim_info.get('start_time', 0.0),
+                        'is_running': sim_info.get('status') == 'running',
+                        'num_targets': len(getattr(self, 'targets', [])),
+                        'num_formations': len(getattr(self, 'formations', []))
+                    }
+                else:
+                    raise ValueError(f"Simulation {simulation_id} not found")
+            else:
+                # 获取通用状态
+                return {
+                    'current_time': self.current_time,
+                    'is_running': hasattr(self, 'simulation_params') and self.simulation_params is not None,
+                    'num_targets': len(getattr(self, 'targets', [])),
+                    'num_formations': len(getattr(self, 'formations', [])),
+                    'active_simulations': self.get_active_simulation_count()
+                }
+        except Exception as e:
+            logger.error(f"Error getting simulation status: {str(e)}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'simulation_id': simulation_id
+            }
 
     def get_simulation_results(self, simulation_id: str = None) -> Dict[str, Any]:
         """获取仿真结果"""
