@@ -62,15 +62,3 @@ def get_config(config_name=None):
     if config_name is None:
         config_name = os.environ.get('FLASK_ENV', 'default')
     return config.get(config_name, config['default'])
-
-def initialize_app_services(app, socketio):
-    """应用服务初始化函数"""
-    from services.system_monitor import SystemMonitor
-    from services.websocket_service import WebSocketService
-
-    # 这里可以添加服务初始化逻辑
-    pass
-
-
-# 导出常用的配置
-__all__ = ['Config', 'DevelopmentConfig', 'ProductionConfig', 'TestingConfig', 'config', 'get_config']
