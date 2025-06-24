@@ -724,14 +724,15 @@ class SimulationService:
                 'time_series': {}
             }
 
+    # 在 simulation_service.py 中添加这些方法，如果尚未存在
+
     def get_active_simulation_count(self):
         """返回活跃仿真数量"""
         try:
-            # 如果有活跃仿真的跟踪机制，返回实际数量
-            if hasattr(self, '_active_simulations'):
+            if hasattr(self, '_active_simulations') and self._active_simulations:
                 return len(self._active_simulations)
 
-            # 简化实现：检查是否有当前运行的仿真
+            # 检查是否有当前运行的仿真
             if hasattr(self, 'simulation_params') and self.simulation_params is not None:
                 return 1
 
@@ -739,6 +740,41 @@ class SimulationService:
         except Exception as e:
             logger.error(f"Error getting active simulation count: {str(e)}")
             return 0
+
+    def get_legacy_status(self):
+        """兼容旧版状态接口"""
+        try:
+            is_running = (hasattr(self, 'simulation_params') and
+                          self.simulation_params is not None)
+
+            status_data = {
+                'status': 'running' if is_running else 'idle',
+                'current_time': getattr(self, 'current_time', 0.0),
+                'simulations': [],
+                'active_count': self.get_active_simulation_count(),
+                'timestamp': time.time()
+            }
+
+            # 如果有活跃仿真，添加基本信息
+            if is_running:
+                status_data['simulations'].append({
+                    'id': 'default',
+                    'status': 'running',
+                    'current_time': self.current_time,
+                    'targets': len(getattr(self, 'targets', [])),
+                    'formations': len(getattr(self, 'formations', []))
+                })
+
+            return status_data
+        except Exception as e:
+            logger.error(f"Error getting legacy status: {str(e)}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'simulations': [],
+                'active_count': 0,
+                'timestamp': time.time()
+            }
 
     def get_legacy_status(self):
         """兼容旧版状态接口"""

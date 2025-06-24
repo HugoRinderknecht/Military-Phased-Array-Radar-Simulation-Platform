@@ -1,9 +1,9 @@
 import json
-import uuid
-import os
-from datetime import datetime
-from typing import Dict, Any, List, Optional
 import logging
+import os
+import uuid
+from datetime import datetime
+from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +14,21 @@ class ConfigService:
     def __init__(self):
         self.config_dir = 'data/configurations'
         self._ensure_config_dir()
+
+    def validate_radar_model(self, model_params: dict):
+        """验证雷达模型参数"""
+        errors = []
+        # 添加雷达特定参数验证
+        if 'frequency' not in model_params:
+            errors.append("Missing radar frequency")
+        elif model_params['frequency'] < 1e6:
+            errors.append("Invalid frequency value")
+
+        # 添加更多验证规则
+        if 'power' in model_params and model_params['power'] <= 0:
+            errors.append("Power must be positive")
+
+        return {'valid': len(errors) == 0, 'errors': errors}
 
     def _ensure_config_dir(self):
         """确保配置目录存在"""
@@ -207,32 +222,84 @@ class ConfigService:
             errors = []
             warnings = []
 
-            # 检查必要字段
+            # 1. 基本字段验证
             if not isinstance(config_data, dict):
-                errors.append("Configuration must be a dictionary")
-                return {'valid': False, 'errors': errors, 'warnings': warnings}
+                errors.append("配置数据必须是字典")
+                return {
+                    'valid': False,
+                    'errors': errors,
+                    'warnings': warnings
+                }
 
-            # 检查基本字段
-            if 'name' in config_data and not isinstance(config_data['name'], str):
-                errors.append("Name must be a string")
+            # 2. 必要字段检查
+            required_fields = ['name', 'config_type', 'config_data']
+            for field in required_fields:
+                if field not in config_data:
+                    errors.append(f"缺少必要字段: {field}")
 
-            if 'description' in config_data and not isinstance(config_data['description'], str):
-                errors.append("Description must be a string")
+            # 3. 名称验证
+            if 'name' in config_data:
+                name = config_data['name']
+                if not isinstance(name, str):
+                    errors.append("名称必须是字符串")
+                elif len(name) < 3:
+                    errors.append("名称长度至少为3个字符")
 
-            # 可以根据需要添加更多验证规则
-            # 例如：验证雷达参数、环境参数、目标参数等
+            # 4. 配置类型验证
+            if 'config_type' in config_data:
+                valid_types = ['radar', 'environment', 'target', 'simulation']
+                if config_data['config_type'] not in valid_types:
+                    errors.append(f"无效的配置类型。支持的类型: {', '.join(valid_types)}")
+
+            # 5. 配置内容验证
+            if 'config_data' in config_data:
+                config_content = config_data['config_data']
+                if not isinstance(config_content, dict):
+                    errors.append("配置数据必须是字典")
+                else:
+                    # 根据配置类型进行特定验证
+                    config_type = config_data.get('config_type', '')
+
+                    # 雷达配置验证
+                    if config_type == 'radar':
+                        radar_config = config_content.get('radar', {})
+
+                        # 频率验证
+                        if 'frequency' in radar_config:
+                            freq = radar_config['frequency']
+                            if not isinstance(freq, (int, float)):
+                                errors.append("雷达频率必须是数字")
+                            elif freq < 1e6:
+                                errors.append("雷达频率过低 (最小1MHz)")
+                            elif freq > 100e9:
+                                warnings.append("雷达频率非常高，可能超出实际应用范围")
+
+                        # 功率验证
+                        if 'power' in radar_config:
+                            power = radar_config['power']
+                            if not isinstance(power, (int, float)):
+                                errors.append("雷达功率必须是数字")
+                            elif power <= 0:
+                                errors.append("雷达功率必须为正数")
+                            elif power > 1000:
+                                warnings.append("雷达功率非常高，可能超出安全范围")
+
+            # 6. 如果没有错误但有警告，添加一条成功消息
+            if not errors and warnings:
+                warnings.append("配置验证通过，但有需要注意的警告")
+            elif not errors and not warnings:
+                warnings.append("配置验证成功，没有发现问题")
 
             return {
                 'valid': len(errors) == 0,
                 'errors': errors,
                 'warnings': warnings
             }
-
         except Exception as e:
-            logger.error(f"Failed to validate configuration: {str(e)}")
+            logger.error(f"验证配置时出错: {str(e)}", exc_info=True)
             return {
                 'valid': False,
-                'errors': [f"Validation failed: {str(e)}"],
+                'errors': [f"验证过程中发生错误: {str(e)}"],
                 'warnings': []
             }
 
@@ -272,7 +339,13 @@ class ConfigService:
                     name_match = query in config_record['name'].lower()
                     desc_match = query in config_record.get('description', '').lower()
 
-                    if name_match or desc_match:
+                    # 搜索配置内容
+                    content_match = False
+                    if 'config' in config_record and isinstance(config_record['config'], dict):
+                        config_str = json.dumps(config_record['config']).lower()
+                        content_match = query in config_str
+
+                    if name_match or desc_match or content_match:
                         config_summary = {
                             'id': config_record['id'],
                             'name': config_record['name'],

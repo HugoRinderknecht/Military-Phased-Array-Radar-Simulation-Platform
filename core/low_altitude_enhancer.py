@@ -1,9 +1,25 @@
+from typing import List, Dict, Optional
+
 import numpy as np
-from typing import List, Dict, Optional, Tuple
 from numba import njit, prange, float64, complex128, int32, objmode
 from numba.experimental import jitclass
-import math
-import scipy.special as sp  # 用于菲涅尔衍射计算
+
+
+# 确保数组连续性的辅助函数
+@njit
+def ensure_contiguous_complex(arr):
+    """确保复数数组是连续的"""
+    if not arr.flags.c_contiguous:
+        return np.ascontiguousarray(arr)
+    return arr
+
+
+@njit
+def ensure_contiguous_float(arr):
+    """确保浮点数组是连续的"""
+    if not arr.flags.c_contiguous:
+        return np.ascontiguousarray(arr)
+    return arr
 
 
 # 假设的Track和Environment类
@@ -222,7 +238,7 @@ def _generate_steering_vector(stap_channels, stap_pulses):
             idx = channel * stap_pulses + pulse
             phase = (channel * target_spatial_freq + pulse * target_doppler_freq)
             steering_vector[idx] = np.exp(1j * phase)
-    return steering_vector.reshape(-1, 1)
+    return np.ascontiguousarray(steering_vector.reshape(-1, 1))
 
 
 @njit(complex128[:, :](int32, int32, float64[:], float64[:], float64))
@@ -237,7 +253,7 @@ def _build_clutter_covariance_matrix(stap_channels, stap_pulses, track_state, mu
             spatial_freq = channel * 2 * np.pi / stap_channels
             temporal_freq = pulse * 2 * np.pi / stap_pulses
             base_clutter = 1.0
-            angle_factor = max(0.1, np.cos(spatial_freq))
+            angle_factor = np.maximum(0.1, np.cos(spatial_freq))
             doppler_factor = 1.0 + 0.5 * np.cos(temporal_freq)
             clutter_power = base_clutter * angle_factor * doppler_factor
             multipath_factor = 1.0 + reflection_coeff * np.cos(phase_diff + spatial_freq)
@@ -249,39 +265,70 @@ def _build_clutter_covariance_matrix(stap_channels, stap_pulses, track_state, mu
             phase = np.random.uniform(0, 2 * np.pi)
             covariance[i, j] = correlation_coeff * np.exp(1j * phase)
             covariance[j, i] = np.conj(covariance[i, j])
-    return covariance
+    return np.ascontiguousarray(covariance)
 
 
 @njit(complex128[:, :](complex128[:, :], complex128[:, :]))
 def _calculate_stap_weights(clutter_covariance, steering_vector):
     try:
+        # 确保输入数组是连续的
+        clutter_covariance = np.ascontiguousarray(clutter_covariance)
+        steering_vector = np.ascontiguousarray(steering_vector)
+
+        # 计算逆矩阵
         inv_covariance = np.linalg.inv(clutter_covariance + np.eye(clutter_covariance.shape[0]) * 1e-6)
-        numerator = inv_covariance @ steering_vector
-        denominator = np.conj(steering_vector.T) @ inv_covariance @ steering_vector
+        inv_covariance = np.ascontiguousarray(inv_covariance)
+
+        # 优化矩阵乘法顺序 - 使用dot产品替代@操作符
+        numerator = np.dot(inv_covariance, steering_vector)
+        temp = np.dot(inv_covariance, steering_vector)
+        denominator = np.dot(np.conj(steering_vector.T), temp)
+
         weights = numerator / denominator
+        return np.ascontiguousarray(weights)
     except:
-        regularized_cov = clutter_covariance + np.eye(clutter_covariance.shape[0]) * 0.1
+        # 异常处理分支也进行同样优化
+        regularized_cov = np.ascontiguousarray(clutter_covariance + np.eye(clutter_covariance.shape[0]) * 0.1)
         inv_covariance = np.linalg.inv(regularized_cov)
-        numerator = inv_covariance @ steering_vector
-        denominator = np.conj(steering_vector.T) @ inv_covariance @ steering_vector
+        inv_covariance = np.ascontiguousarray(inv_covariance)
+
+        numerator = np.dot(inv_covariance, steering_vector)
+        temp = np.dot(inv_covariance, steering_vector)
+        denominator = np.dot(np.conj(steering_vector.T), temp)
+
         weights = numerator / denominator
-    return weights
+        return np.ascontiguousarray(weights)
 
 
 @njit(float64(complex128[:, :], complex128[:, :]))
 def _calculate_sincr_improvement(weights, covariance):
-    numerator = abs(np.conj(weights.T) @ weights) ** 2
-    denominator = np.real(np.conj(weights.T) @ covariance @ weights)
-    return 10 * np.log10(numerator / max(denominator, 1e-10))
+    # 确保输入数组连续性
+    weights = np.ascontiguousarray(weights)
+    covariance = np.ascontiguousarray(covariance)
+
+    # 使用dot产品替代@操作符
+    wH_w = np.dot(np.conj(weights.T), weights)
+    numerator = np.abs(wH_w[0, 0]) ** 2
+
+    # 分步计算以确保数组连续性
+    temp = np.dot(covariance, weights)
+    temp = np.ascontiguousarray(temp)
+    wH_cov_w = np.dot(np.conj(weights.T), temp)
+    denominator = np.real(wH_cov_w[0, 0])
+
+    # 避免除以零
+    denominator = max(denominator, 1e-10)
+
+    return 10 * np.log10(numerator / denominator)
 
 
-@njit(float64[:](float64[:], float64[:], float64))
+@njit(float64[:, :](float64[:], float64[:], float64))
 def _generate_line_of_sight_points(start, end, resolution):
     distance = np.linalg.norm(end - start)
     num_points = int(distance / resolution) + 1
     points = np.zeros((num_points, 3))
     for i in range(num_points):
-        t = i / max(num_points - 1, 1)
+        t = i / np.maximum(num_points - 1, 1)
         points[i] = start + t * (end - start)
     return points
 
@@ -324,26 +371,39 @@ def _find_reflection_point(radar_pos, target_pos, terrain_elevation, terrain_inf
 
 @njit(float64(complex128[:], complex128[:], complex128[:], float64))
 def _lms_adaptive_filter(reference, received, coefficients, step_size):
+    # 确保数组连续性
+    reference = np.ascontiguousarray(reference)
+    received = np.ascontiguousarray(received)
+    coefficients = np.ascontiguousarray(coefficients)
+
     filter_order = len(coefficients)
-    signal_length = min(len(reference), len(received))
+    signal_length = np.minimum(len(reference), len(received))
     initial_mse = 0.0
+
+    # 计算初始MSE
     for i in range(signal_length):
         error = reference[i] - received[i]
         initial_mse += (error.real ** 2 + error.imag ** 2)
     initial_mse /= signal_length
+
+    # LMS自适应滤波
     for i in range(signal_length - filter_order):
-        input_vector = received[i:i + filter_order]
-        output = np.dot(coefficients.conj(), input_vector)
+        input_vector = np.ascontiguousarray(received[i:i + filter_order])
+        # 使用dot产品替代@操作符
+        output = np.dot(np.conj(coefficients), input_vector)
         error = reference[i] - output
-        coefficients += step_size * error.conj() * input_vector
+        coefficients += step_size * np.conj(error) * input_vector
+
+    # 计算最终MSE
     final_mse = 0.0
     for i in range(signal_length - filter_order):
-        input_vector = received[i:i + filter_order]
-        output = np.dot(coefficients.conj(), input_vector)
+        input_vector = np.ascontiguousarray(received[i:i + filter_order])
+        output = np.dot(np.conj(coefficients), input_vector)
         error = reference[i] - output
         final_mse += (error.real ** 2 + error.imag ** 2)
     final_mse /= (signal_length - filter_order)
-    return 10 * np.log10(initial_mse / max(final_mse, 1e-10))
+
+    return 10 * np.log10(initial_mse / np.maximum(final_mse, 1e-10))
 
 
 class LowAltitudeEnhancer:
@@ -620,7 +680,6 @@ class LowAltitudeEnhancer:
         return _calculate_sincr_improvement(optimal_weights, clutter_covariance)
 
     def apply_polarimetric_processing(self, track: Track) -> float:
-        # 与之前相同
         scattering_matrix = self._generate_polarimetric_scattering_matrix(track)
         polarimetric_features = self._extract_polarimetric_features(scattering_matrix)
         target_probability = self._classify_target_clutter_polarimetric(polarimetric_features)
@@ -641,7 +700,7 @@ class LowAltitudeEnhancer:
         ])
         severity = _analyze_terrain_occlusion(radar_pos, target_pos, terrain_elevation, terrain_info)
         occlusion_map.severity = severity
-        occlusion_map.probability = min(severity * 1.5, 1.0)
+        occlusion_map.probability = np.minimum(severity * 1.5, 1.0)
         target_azimuth = np.arctan2(target_pos[1], target_pos[0])
         occlusion_map.azimuth_range = [target_azimuth - np.pi / 18, target_azimuth + np.pi / 18]
         target_elevation = np.arcsin(target_pos[2] / np.linalg.norm(target_pos))
@@ -717,11 +776,10 @@ class LowAltitudeEnhancer:
 
         return received_signal
 
-    # 以下函数与之前相同，为保持完整性保留
     def apply_ml_enhancement(self, track: Track) -> float:
         features = self._extract_ml_features(track)
         target_confidence = self._simple_target_classifier(features)
-        return max(0, (target_confidence - 0.5) * 2)
+        return np.maximum(0, (target_confidence - 0.5) * 2)
 
     def fuse_with_auxiliary_sensors(self, track: Track):
         ir_detection = self._simulate_ir_detection(track)
@@ -759,7 +817,7 @@ class LowAltitudeEnhancer:
             score += 0.2
         if abs(features['phase_diff']) < np.pi / 6:
             score += 0.1
-        return min(score, 1.0)
+        return np.minimum(score, 1.0)
 
     def _optimize_polarization_weights(self, S: np.ndarray) -> np.ndarray:
         eigenvals, eigenvecs = np.linalg.eig(S @ S.conj().T)
@@ -770,7 +828,7 @@ class LowAltitudeEnhancer:
         return target_probability * 3.0
 
     def _calculate_frequency_diversity_gain(self, num_bands: int) -> float:
-        return min(1.0 + 0.1 * (num_bands - 1), 1.5)
+        return np.minimum(1.0 + 0.1 * (num_bands - 1), 1.5)
 
     def _extract_ml_features(self, track: Track) -> np.ndarray:
         features = []
@@ -838,3 +896,4 @@ class LowAltitudeEnhancer:
         for measurement, weight in zip(measurements, weights):
             fused_position += weight * measurement
         return fused_position
+

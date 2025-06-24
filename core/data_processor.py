@@ -783,5 +783,37 @@ class OptimizedDataProcessor:
             logger.info("OptimizedDataProcessor reset completed")
 
 
+# 添加信号处理接口支持
+def process_raw_signal(self, signal_data: np.ndarray) -> List[Detection]:
+    """处理原始信号数据"""
+    # 实现信号处理流水线
+    processed = self.signal_processor.apply_filters(signal_data)
+    return self.signal_processor.detect_peaks(processed)
+
+
+# 添加RCS计算接口
+def calculate_rcs(self, target: Dict[str, Any]) -> float:
+    """计算目标RCS"""
+    return self.rcs_calculator.calculate(
+        shape=target['shape'],
+        material=target['material'],
+        frequency=self.radar_system.frequency
+    )
+
+
+# 添加批量处理支持
+async def batch_process(self, config_id: str, dataset_id: str):
+    """批量处理数据集"""
+    config = self.config_service.load_configuration(config_id)
+    dataset = self.dataset_service.load_dataset(dataset_id)
+
+    results = []
+    for data in dataset:
+        result = await self.process_tracking_data_async(data)
+        results.append(result)
+
+    return results
+
+
 # 为了向后兼容，保持原类名的别名
 DataProcessor = OptimizedDataProcessor

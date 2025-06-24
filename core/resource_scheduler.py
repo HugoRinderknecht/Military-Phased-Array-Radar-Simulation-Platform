@@ -1,8 +1,9 @@
-import numpy as np
-from typing import List, Dict, Any
-from dataclasses import dataclass
-from enum import Enum
 import heapq
+import threading
+from dataclasses import dataclass
+from datetime import time
+from enum import Enum
+from typing import List, Dict, Any
 
 
 class TaskType(Enum):
@@ -37,19 +38,38 @@ class ScheduleResult:
 
 
 class ResourceScheduler:
-    def __init__(self, schedule_interval: float = 60.0):
-        self.schedule_interval = schedule_interval
-        self.current_time = 0.0
-        self.task_queue = []
+    def get_scheduler_status(self) -> Dict[str, Any]:
+        """获取调度器状态"""
+        return {
+            'current_time': self.current_time,
+            'schedule_interval': self.schedule_interval,
+            'pending_tasks': len(self.task_queue),
+            'active_threads': threading.active_count(),
+            'scheduled_tasks_count': len(self.scheduled_tasks_history),
+            'last_schedule_time': self.scheduled_tasks_history[-1][
+                'timestamp'] if self.scheduled_tasks_history else None,
+            'status': 'active' if self.task_queue else 'idle'
+        }
 
     def schedule_resources(self, tasks: List[RadarTask], strategy: str = "priority") -> ScheduleResult:
+        # 为每个任务计算动态优先级
         for task in tasks:
             task.priority = self._calculate_dynamic_priority(task)
 
+        # 根据策略选择调度方法
         if strategy == "priority":
-            return self._priority_based_scheduling(tasks)
+            result = self._priority_based_scheduling(tasks)
         else:
-            return self._time_pointer_scheduling(tasks)
+            result = self._time_pointer_scheduling(tasks)
+
+        # 记录调度历史
+        self.scheduled_tasks_history.append({
+            'timestamp': time.time(),
+            'result': result,
+            'strategy': strategy
+        })
+
+        return result
 
     def _calculate_dynamic_priority(self, task: RadarTask) -> float:
         """计算动态优先级，考虑多种因素"""
@@ -90,7 +110,8 @@ class ResourceScheduler:
         return comprehensive_priority
 
     def _priority_based_scheduling(self, tasks: List[RadarTask]) -> ScheduleResult:
-        tasks_sorted = sorted(tasks, key=lambda t: t.priority)
+        # 按优先级排序
+        tasks_sorted = sorted(tasks, key=lambda t: t.priority, reverse=True)
 
         scheduled = []
         delayed = []
@@ -98,16 +119,20 @@ class ResourceScheduler:
         current_time = self.current_time
 
         for task in tasks_sorted:
+            # 检查任务是否能在截止时间内完成
             if current_time + task.duration > task.due_time:
                 if task.hard_constraint:
+                    # 硬约束任务必须执行
                     scheduled.append(task)
                     current_time += task.duration
                 else:
+                    # 非硬约束任务延迟或取消
                     if task.due_time - current_time > task.duration * 0.5:
                         delayed.append(task)
                     else:
                         cancelled.append(task)
             else:
+                # 检查是否在调度时间窗口内
                 if current_time < self.current_time + self.schedule_interval:
                     scheduled.append(task)
                     current_time += task.duration
@@ -205,7 +230,7 @@ class ResourceScheduler:
         return total_utility
 
     def add_task(self, task: RadarTask):
-        heapq.heappush(self.task_queue, (task.priority, task))
+        heapq.heappush(self.task_queue, (-task.priority, task))  # 使用负值实现最大堆
 
     def update_time(self, new_time: float):
         self.current_time = new_time
