@@ -1,0 +1,85 @@
+# 雷达配置文件 (Radar Configuration)
+# 本文件定义雷达仿真系统的所有配置参数
+
+[radar]
+    # 基本参数
+    frequency = 10000000000      # 工作频率 [Hz] (X波段 10GHz)
+    bandwidth = 10000000         # 信号带宽 [Hz] (10 MHz)
+    pulse_width = 0.00001       # 脉冲宽度 [s] (10微秒)
+    prf = 2000.0                # 脉冲重复频率 [Hz]
+    sample_rate = 20000000      # 采样率 [Hz] (20 MHz)
+    transmit_power = 100000      # 发射功率 [W] (100 kW)
+
+[antenna]
+    # 天线参数
+    array_shape = "planar"      # 阵列形状 (linear, planar, circular)
+    array_size = [32, 32]      # 阵列尺寸 [M, N]
+    element_spacing = 0.015      # 阵元间距 [m] (半波长 @ X波段)
+    antenna_gain = 40.0         # 天线增益 [dB]
+    sidelobe_level = -25.0      # 旁瓣电平 [dB]
+
+[receiver]
+    # 接收机参数
+    noise_figure = 3.0          # 噪声系数 [dB]
+    system_losses = 8.0          # 系统损耗 [dB]
+    if_gain = 0.0              # 中频增益 [dB]
+
+[signal_processing]
+    # 信号处理参数
+    pulse_compression = true     # 启用脉冲压缩
+    compression_window = "hamming"  # 压缩窗函数
+    mtd_enabled = true          # 启用MTD
+    mtd_pulses = 64            # MTD脉冲数
+    cfar_enabled = true         # 启用CFAR
+    cfar_type = "ca"           # CFAR类型 (ca, go, so, os)
+    cfar_training_cells = 20    # 训练单元数
+    cfar_guard_cells = 2       # 保护单元数
+    false_alarm_rate = 0.000001 # 虚警率 (1e-6)
+
+[data_processing]
+    # 数据处理参数
+    track_init_method = "rule"  # 航迹起始方法 (rule, logic, hough)
+    m_value = 3                 # M/N逻辑的M值
+    n_value = 3                 # M/N逻辑的N值
+    association_method = "nn"   # 数据关联方法 (nn, jpda, jpda_mht)
+    gate_threshold = 3.0        # 波门阈值 (sigma倍数)
+    filter_type = "imm"         # 滤波器类型 (kf, ekf, ukf, imm)
+    max_tracks = 100            # 最大航迹数
+
+[scheduler]
+    # 调度器参数
+    schedule_interval = 0.05    # 调度间隔 [s] (50ms)
+    priority_method = "dynamic"  # 优先级方法 (static, dynamic, edf)
+    time_resource_limit = 0.90  # 时间资源利用率上限
+    max_task_delay = 5        # 最大任务延迟次数
+
+[environment]
+    # 环境模拟参数
+    clutter_enabled = true      # 启用杂波
+    clutter_type = "ground"    # 杂波类型 (ground, sea, weather)
+    jamming_enabled = false     # 启用干扰
+    max_range = 500000        # 最大作用距离 [m] (500 km)
+    max_targets = 100          # 最大目标数
+
+[network]
+    # 网络参数
+    host = "0.0.0.0"           # 服务器地址
+    port = 8000                 # 服务器端口
+    websocket_path = "/ws"      # WebSocket路径
+    max_connections = 10        # 最大并发连接数
+    heartbeat_interval = 30.0   # 心跳间隔 [s]
+
+[logging]
+    # 日志参数
+    log_path = "./logs"         # 日志文件路径
+    log_level = "INFO"          # 日志级别 (DEBUG, INFO, WARNING, ERROR)
+    log_to_console = true       # 输出到控制台
+    log_to_file = true          # 输出到文件
+    rotation = "100 MB"         # 日志轮转大小
+    retention = "30 days"       # 日志保留时间
+
+[performance]
+    # 性能参数
+    target_fps = 20             # 目标帧率 [Hz]
+    max_frame_time = 100       # 最大帧处理时间 [ms]
+    enable_profiling = false    # 启用性能分析
