@@ -223,6 +223,113 @@ def angle_between_vectors(v1: np.ndarray, v2: np.ndarray) -> float:
     return np.arccos(np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0))
 
 
+# ==================== 角度归一化 ====================
+
+def normalize_angle(angle: float) -> float:
+    """将角度归一化到 [-pi, pi] 范围"""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def angle_difference(angle1: float, angle2: float) -> float:
+    """计算两个角度的最小差值"""
+    diff = angle1 - angle2
+    return normalize_angle(diff)
+
+
+# ==================== 向量运算辅助函数 ====================
+
+def vector_magnitude(v: np.ndarray) -> float:
+    """计算向量模长"""
+    return np.linalg.norm(v)
+
+
+def vector_distance(v1: np.ndarray, v2: np.ndarray) -> float:
+    """计算两个向量之间的距离"""
+    return np.linalg.norm(v1 - v2)
+
+
+def dot_product(v1: np.ndarray, v2: np.ndarray) -> float:
+    """计算向量点积"""
+    return np.dot(v1, v2)
+
+
+def cross_product(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """计算向量叉积"""
+    return np.cross(v1, v2)
+
+
+# ==================== 统计函数 ====================
+
+def mean(data: np.ndarray) -> float:
+    """计算均值"""
+    return np.mean(data)
+
+
+def std(data: np.ndarray) -> float:
+    """计算标准差"""
+    return np.std(data)
+
+
+def variance(data: np.ndarray) -> float:
+    """计算方差"""
+    return np.var(data)
+
+
+def median(data: np.ndarray) -> float:
+    """计算中位数"""
+    return np.median(data)
+
+
+# ==================== 插值函数 ====================
+
+def linear_interpolate(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    """线性插值"""
+    return np.interp(x_new, x, y)
+
+
+def spline_interpolate(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    """样条插值"""
+    from scipy.interpolate import CubicSpline
+    cs = CubicSpline(x, y)
+    return cs(x_new)
+
+
+def nearest_neighbor(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    """最近邻插值"""
+    indices = np.searchsorted(x, x_new)
+    indices = np.clip(indices, 0, len(y) - 1)
+    return y[indices]
+
+
+# ==================== 窗函数 ====================
+
+def get_window(window_type: str, n: int, **kwargs) -> np.ndarray:
+    """获取窗函数"""
+    return np.window(n, window_type, **kwargs)
+
+
+def apply_window(signal: np.ndarray, window: np.ndarray) -> np.ndarray:
+    """应用窗函数"""
+    return signal * window
+
+
+# ==================== FFT相关 ====================
+
+def fft_shift(x: np.ndarray) -> np.ndarray:
+    """FFT频移"""
+    return np.fft.fftshift(x)
+
+
+def fft_frequency(n: int, d: float = 1.0) -> np.ndarray:
+    """计算FFT频率轴"""
+    return np.fft.fftfreq(n, d)
+
+
+def next_power_of_2(n: int) -> int:
+    """计算下一个2的幂次"""
+    return 1 << (n - 1).bit_length()
+
+
 __all__ = [
     'db_to_linear', 'linear_to_db', 'range_resolution',
     'doppler_frequency', 'doppler_velocity', 'two_wayPropagation_loss',
@@ -233,4 +340,10 @@ __all__ = [
     'beam_width', 'beam_width_degrees', 'antenna_gain', 'antenna_gain_db',
     'deg_to_rad', 'rad_to_deg', 'wrap_angle',
     'normalize_vector', 'angle_between_vectors',
+    'normalize_angle', 'angle_difference',
+    'vector_magnitude', 'vector_distance', 'dot_product', 'cross_product',
+    'mean', 'std', 'variance', 'median',
+    'linear_interpolate', 'spline_interpolate', 'nearest_neighbor',
+    'get_window', 'apply_window',
+    'fft_shift', 'fft_frequency', 'next_power_of_2',
 ]

@@ -19,34 +19,19 @@ from radar.common.types import (
     SwerlingModel,
     WorkMode,
     TaskType,
-    CoordinateSystem,
+    BeamType,
+    TrackState,
+    CFARType,
+    FilterType,
 
     # 数据类
-    Vector3D,
+    Position3D,
+    Velocity3D,
     Attitude,
-    Position,
-    Velocity,
-
-    # 系统状态
-    SimulationState,
-    SystemState,
-)
-
-from radar.common.constants import (
-    # 物理常数
-    LIGHT_SPEED,
-    BOLTZMANN_CONSTANT,
-    STANDARD_TEMPERATURE,
-
-    # 雷达常数
-    EARTH_RADIUS,
-    RADAR_CONSTANT,
-
-    # 数学常数
-    PI,
-    TWO_PI,
-    DEG_TO_RAD,
-    RAD_TO_DEG,
+    SphericalCoord,
+    WindowParams,
+    Plot,
+    Track,
 )
 
 __all__ = [
@@ -56,22 +41,17 @@ __all__ = [
     "SwerlingModel",
     "WorkMode",
     "TaskType",
-    "CoordinateSystem",
-    "Vector3D",
-    "Attitude",
-    "Position",
-    "Velocity",
-    "SimulationState",
-    "SystemState",
+    "BeamType",
+    "TrackState",
+    "CFARType",
+    "FilterType",
 
-    # 常数
-    "LIGHT_SPEED",
-    "BOLTZMANN_CONSTANT",
-    "STANDARD_TEMPERATURE",
-    "EARTH_RADIUS",
-    "RADAR_CONSTANT",
-    "PI",
-    "TWO_PI",
-    "DEG_TO_RAD",
-    "RAD_TO_DEG",
+    # 数据类
+    "Position3D",
+    "Velocity3D",
+    "Attitude",
+    "SphericalCoord",
+    "WindowParams",
+    "Plot",
+    "Track",
 ]

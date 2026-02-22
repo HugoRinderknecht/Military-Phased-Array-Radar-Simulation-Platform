@@ -287,4 +287,48 @@ __all__ = [
     'rotate_about_x', 'rotate_about_y', 'rotate_about_z',
     'euler_to_rotation_matrix',
     'lla_to_enu', 'enu_to_lla',
+    'enu_to_azel', 'azel_to_enu',  # 别名
+    'enu_to_ecef', 'ecef_to_enu',  # ECEF转换
+    'rotation_matrix_x', 'rotation_matrix_y', 'rotation_matrix_z', 'rotation_matrix_zyx',  # 旋转矩阵别名
+    'geodetic_to_ecef', 'ecef_to_geodetic',  # 大地坐标转换
 ]
+
+# 别名
+enu_to_azel = enu_to_radar
+azel_to_enu = radar_to_enu
+rotation_matrix_x = rotate_about_x
+rotation_matrix_y = rotate_about_y
+rotation_matrix_z = rotate_about_z
+rotation_matrix_zyx = euler_to_rotation_matrix
+geodetic_to_ecef = lla_to_enu
+ecef_to_geodetic = enu_to_lla
+
+
+# ==================== ECEF坐标转换 ====================
+
+def enu_to_ecef(enu: np.ndarray, ref_lat: float, ref_lon: float) -> np.ndarray:
+    """ENU转ECEF"""
+    sin_lat, cos_lat = np.sin(ref_lat), np.cos(ref_lat)
+    sin_lon, cos_lon = np.sin(ref_lon), np.cos(ref_lon)
+
+    R = np.array([
+        [-sin_lon, -sin_lat*cos_lon, cos_lat*cos_lon],
+        [cos_lon,  -sin_lat*sin_lon, cos_lat*sin_lon],
+        [0,        cos_lat,          sin_lat]
+    ])
+
+    return R @ enu
+
+
+def ecef_to_enu(ecef: np.ndarray, ref_lat: float, ref_lon: float) -> np.ndarray:
+    """ECEF转ENU"""
+    sin_lat, cos_lat = np.sin(ref_lat), np.cos(ref_lat)
+    sin_lon, cos_lon = np.sin(ref_lon), np.cos(ref_lon)
+
+    R = np.array([
+        [-sin_lon, cos_lon, 0],
+        [-sin_lat*cos_lon, -sin_lat*sin_lon, cos_lat],
+        [cos_lat*cos_lon, cos_lat*sin_lon, sin_lat]
+    ])
+
+    return R @ ecef

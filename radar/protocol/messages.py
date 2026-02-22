@@ -15,9 +15,38 @@ from datetime import datetime
 import numpy as np
 
 from radar.common.types import (
-    Position3D, Velocity3D, Plot, Track, AzimuthElevation,
-    BeamStatus, SimulationState, SystemState
+    Position3D, Velocity3D, Plot, Track
 )
+
+
+# Define missing types locally
+class AzimuthElevation:
+    def __init__(self, azimuth: float = 0.0, elevation: float = 0.0):
+        self.azimuth = azimuth
+        self.elevation = elevation
+
+
+class BeamStatus:
+    def __init__(self):
+        self.azimuth = 0.0
+        self.elevation = 0.0
+        self.beam_id = 0
+        self.task_id = 0
+
+
+class SystemState:
+    IDLE = "idle"
+    INITIALIZING = "initializing"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
+class SimulationState:
+    STOPPED = "stopped"
+    RUNNING = "running"
+    PAUSED = "paused"
 
 
 # ============================================================================
@@ -335,7 +364,9 @@ class DetectionEventMessage(BaseMessage):
         snr: 信噪比 [dB]
     """
     type: str = MessageType.EVENT_DETECTION
-    plot: Plot = field(default_factory=Plot)
+    plot: Plot = field(default_factory=lambda: Plot(
+        id=0, timestamp=0, position=Position3D(0, 0, 0)
+    ))
     snr: float = 0.0
 
 

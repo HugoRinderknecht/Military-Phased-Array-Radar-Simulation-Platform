@@ -311,4 +311,8 @@ class NumpyRingBuffer:
         return self.count
 
 
-__all__ = ['RingBuffer', 'NumpyRingBuffer']
+# 别名
+FixedRingBuffer = RingBuffer
+DynamicRingBuffer = RingBuffer
+
+__all__ = ['RingBuffer', 'NumpyRingBuffer', 'FixedRingBuffer', 'DynamicRingBuffer']

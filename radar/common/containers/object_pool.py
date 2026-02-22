@@ -4,6 +4,7 @@ import queue
 import threading
 from typing import TypeVar, Generic, Type, Optional, Callable, Any
 from abc import ABC, abstractmethod
+import numpy as np
 
 
 T = TypeVar('T')
@@ -151,7 +152,7 @@ class ObjectPool(Generic[T]):
 
 class NumpyArrayPool:
     """NumPy数组对象池"""
-    
+
     def __init__(
         self,
         shape: tuple,
@@ -160,7 +161,6 @@ class NumpyArrayPool:
         max_size: int = 100
     ):
         """初始化NumPy数组池"""
-        import numpy as np
         self.shape = shape
         self.dtype = dtype
         self.max_size = max_size
@@ -175,7 +175,6 @@ class NumpyArrayPool:
     
     def acquire(self) -> np.ndarray:
         """获取一个数组"""
-        import numpy as np
         with self.lock:
             if self.pool:
                 arr = self.pool.pop()
@@ -187,7 +186,6 @@ class NumpyArrayPool:
     
     def release(self, arr: np.ndarray) -> bool:
         """归还数组到池中"""
-        import numpy as np
         if arr.shape != self.shape or arr.dtype != self.dtype:
             return False
         
@@ -209,4 +207,7 @@ class NumpyArrayPool:
             }
 
 
-__all__ = ['PoolableObject', 'ObjectPool', 'NumpyArrayPool']
+__all__ = ['PoolableObject', 'ObjectPool', 'NumpyArrayPool', 'PooledObject']
+
+# 别名
+PooledObject = PoolableObject

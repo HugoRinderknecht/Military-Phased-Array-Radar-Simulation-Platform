@@ -198,9 +198,105 @@ __all__ = [
     'next_power_of_2', 'fft_shift_1d', 'ifft_shift_1d',
     'fft_frequency', 'fft_shift_frequency',
     'generate_window', 'window_correction', 'coherent_gain', 'enbw',
-    'decimate', 'resample', 'upsample',
-    'design_fir_filter', 'design_iir_lowpass', 'apply_filter',
-    'compute_psd', 'compute_spectrogram',
+    'decimate', 'resample', 'resample_signal', 'interpolate',  # 重采样
+    'upsample',
+    'design_fir_filter', 'design_iir_filter', 'apply_fir_filter', 'apply_iir_filter',  # 滤波器
+    'compute_fft', 'compute_psd', 'compute_spectrogram',  # 频谱分析
+    'correlate', 'convolve',  # 相关和卷积
+    'db_to_linear', 'linear_to_db', 'complex_to_db',  # dB转换
+    'envelope', 'instantaneous_phase', 'instantaneous_frequency',  # 瞬时特性
     'matched_filter_coefficients', 'pulse_compression',
     'exponential_correlation', 'generate_correlated_gaussian',
+    'generate_lfm_pulse', 'generate_complex_pulse', 'generate_phase_code', 'generate_noise',  # 信号生成
 ]
+
+
+# 别名
+resample_signal = resample
+design_iir_filter = design_iir_lowpass
+apply_fir_filter = apply_filter
+apply_iir_filter = apply_filter
+interpolate = resample
+compute_fft = np.fft.fft
+correlate = np.correlate
+convolve = np.convolve
+db_to_linear = lambda x: 10**(x/10)
+linear_to_db = lambda x: 10*np.log10(x)
+complex_to_db = lambda x: 20*np.log10(np.abs(x))
+envelope = np.abs
+instantaneous_phase = np.angle
+instantaneous_frequency = lambda x: np.diff(np.unwrap(np.angle(x)))
+
+
+def generate_noise(
+    n_samples: int,
+    noise_type: str = 'gaussian',
+    power: float = 1.0
+) -> np.ndarray:
+    """生成噪声"""
+    if noise_type == 'gaussian':
+        return np.random.randn(n_samples) * np.sqrt(power)
+    elif noise_type == 'uniform':
+        return (np.random.rand(n_samples) - 0.5) * 2 * np.sqrt(3 * power)
+    else:
+        return np.random.randn(n_samples) * np.sqrt(power)
+
+
+def generate_phase_code(
+    code_length: int,
+    code_type: str = 'barker'
+) -> np.ndarray:
+    """生成相位编码序列"""
+    if code_type == 'barker':
+        # Barker码（已知的最佳短码）
+        barker_codes = {
+            2: np.array([1, -1]),
+            3: np.array([1, 1, -1]),
+            4: np.array([1, 1, -1, 1]),
+            5: np.array([1, 1, 1, -1, 1]),
+            7: np.array([1, 1, 1, -1, -1, 1, -1]),
+            11: np.array([1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1]),
+            13: np.array([1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1]),
+        }
+        return barker_codes.get(code_length, np.ones(code_length))
+    elif code_type == 'm_sequence':
+        # 简单的伪随机序列
+        return np.random.choice([1, -1], size=code_length)
+    else:
+        return np.ones(code_length)
+
+
+def generate_lfm_pulse(
+    sample_rate: float,
+    pulse_width: float,
+    bandwidth: float,
+    initial_phase: float = 0.0
+) -> np.ndarray:
+    """生成线性调频（LFM）脉冲"""
+    n_samples = int(sample_rate * pulse_width)
+    t = np.arange(n_samples) / sample_rate
+
+    # 瞬时频率
+    chirp_rate = bandwidth / pulse_width
+    instantaneous_phase = 2 * np.pi * (0.5 * chirp_rate * t**2) + initial_phase
+
+    # 复信号
+    signal = np.exp(1j * instantaneous_phase)
+
+    return signal
+
+
+def generate_complex_pulse(
+    sample_rate: float,
+    pulse_width: float,
+    frequency: float = 0.0,
+    initial_phase: float = 0.0
+) -> np.ndarray:
+    """生成简单复脉冲（单频）"""
+    n_samples = int(sample_rate * pulse_width)
+    t = np.arange(n_samples) / sample_rate
+
+    phase = 2 * np.pi * frequency * t + initial_phase
+    signal = np.exp(1j * phase)
+
+    return signal
