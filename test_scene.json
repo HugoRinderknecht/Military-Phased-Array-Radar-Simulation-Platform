@@ -1,0 +1,25 @@
+{
+  "id": "test-scene-1",
+  "name": "测试场景",
+  "description": "用于测试的场景",
+  "radar_model_id": "test-radar-1",
+  "duration": 100,
+  "time_step": 0.1,
+  "targets": [
+    {
+      "id": "target-1",
+      "name": "目标1",
+      "rcs": 10,
+      "position": {"x": 10000, "y": 0, "z": 5000},
+      "velocity": {"x": 200, "y": 0, "z": 0},
+      "trajectory_type": "linear"
+    }
+  ],
+  "environment": {
+    "temperature": 20,
+    "humidity": 60,
+    "pressure": 101325,
+    "clutter_type": "rayleigh",
+    "clutter_strength": 0.5
+  }
+}
